@@ -3,6 +3,8 @@ import datetime
 import os
 
 from ceilometerclient import client as ceilometer_client
+from keystoneauth1 import discover
+from keystoneauth1.identity import v2
 from keystoneauth1.identity import v3
 from keystoneauth1 import session
 from keystoneclient.v3 import client as keystone_client
@@ -31,9 +33,9 @@ parser.add_argument("--password",
                     help="Password for the user")
 parser.add_argument("--os_auth_url",
                     default=os.environ.get("OS_AUTH_URL",
-                                           "http://10.21.2.3:5000/v3"),
+                                           "http://localhost:5000"),
                     dest="os_auth_url",
-                    help="v3 auth url in format <http://hostname:5000/v3>")
+                    help="Openstack authentification url")
 parser.add_argument("--os_endpoint_type",
                     default=os.environ.get("OS_ENDPOINT_TYPE",
                                            "internalURL"),
@@ -61,21 +63,42 @@ parser.add_argument("--period_end",
                          "<YYYY-MM-DDThh:mm:ss> e.g. 2017-01-13T00:00:00")
 
 
+def _discover_auth_versions(session, auth_url):
+    ks_discover = discover.Discover(session=session, url=auth_url)
+    v2_auth_url = ks_discover.url_for('2.0')
+    v3_auth_url = ks_discover.url_for('3.0')
+    return v2_auth_url, v3_auth_url
+
+
 class Reports(object):
 
     def __init__(self, username, password, auth_url, project_name,
                  user_domain_id=None, project_domain_id=None,
                  endpoint_type='publicURL'):
-        auth = v3.Password(auth_url=auth_url, username=username,
-                           password=password, project_name=project_name,
-                           user_domain_id=user_domain_id,
-                           project_domain_id=project_domain_id)
-        sess = session.Session(auth=auth)
+        sess = session.Session()
+        v2_auth_url, v3_auth_url = _discover_auth_versions(sess, auth_url)
+        use_domain = user_domain_id or project_domain_id
+        use_v3 = v3_auth_url and (use_domain or (not v2_auth_url))
+        use_v2 = v2_auth_url and not use_domain
+
+        if use_v3:
+            auth = v3.Password(auth_url=v3_auth_url, username=username,
+                               password=password, project_name=project_name,
+                               user_domain_id=user_domain_id,
+                               project_domain_id=project_domain_id)
+        elif use_v2:
+            auth = v2.Password(v2_auth_url, username, password,
+                               tenant_name=project_name)
+        else:
+            raise Exception('Unable to determine the Keystone version '
+                            'to authenticate with using the given auth_url.')
+
+        sess.auth = auth
         self.keystone = keystone_client.Client(session=sess)
         self.nova = nova_client.Client(2, session=sess,
-                                       endpoint_type='internalURL')
+                                       endpoint_type=endpoint_type)
         self.cclient = ceilometer_client.get_client(2, session=sess,
-                                       endpoint_type='internalURL')
+                                       endpoint_type=endpoint_type)
 
     def _get_query(self, period_start=None, period_end=None, project_id=None):
         query = []
@@ -112,9 +135,10 @@ class Reports(object):
         query.append(dict(field="metadata.state", op="eq", value="active"))
         hypervisors = self.nova.hypervisors.list()
         host_instances_count = {}
-        for hypervisor in hypervisors: 
+        for hypervisor in hypervisors:
             host = hypervisor.hypervisor_hostname
-            host_query = [dict(field="metadata.instance_host", op="eq", value=host)]
+            host_query = [dict(field="metadata.instance_host", op="eq",
+                               value=host)]
             statistics = self.cclient.statistics.list(
                 'instance', q=query+host_query, groupby='resource_id')
             host_instances_count[host] = len(statistics)
@@ -124,7 +148,7 @@ class Reports(object):
     def get_reports(self, **query_kwargs):
         print self._host_instances_count_old(**query_kwargs)
         print self._host_instances_count(**query_kwargs)
-            
+
 
 def main():
     args = parser.parse_args()
