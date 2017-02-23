@@ -1,7 +1,8 @@
 import argparse
-import datetime
+import logging
 import os
 import pprint
+import sys
 
 from ceilometerclient import client as ceilometer_client
 from keystoneauth1 import discover
@@ -12,22 +13,19 @@ from keystoneclient.v3 import client as keystone_client
 from novaclient import client as nova_client
 
 
-parser = argparse.ArgumentParser()
+logger = logging.getLogger(__file__)
+logging.basicConfig()
+logger.setLevel(logging.INFO)
 
+
+parser = argparse.ArgumentParser()
 
 parser.add_argument("--reports",
                     default='all',
                     help="Report to make. Choose from: all, used_flavors, "
                          "host_instances_count, nova_api_request_rate, "
-                         "swift_api_request_rate, storage_io. \nDefault: all")
-parser.add_argument("--project_id",
-                    help="Specify id of project, which statistics you "
-                         "want to get")
-parser.add_argument("--project-all",
-                    default=False,
-                    action="store_true",
-                    dest="project_all",
-                    help="Statistics of all cloud")
+                         "swift_api_request_rate, storage_io. Can be "
+                         "specified several using comma. Default: all")
 parser.add_argument("--os_username",
                     default=os.environ.get("OS_USERNAME", "admin"),
                     help="Name of the user")
@@ -115,7 +113,7 @@ class Reports(object):
         self.nova = nova_client.Client(2, session=sess,
                                        endpoint_type=endpoint_type)
         self.cclient = ceilometer_client.get_client(2, session=sess,
-                                       endpoint_type=endpoint_type)
+                                                    endpoint_type=endpoint_type)
 
     def _get_query(self, period_start=None, period_end=None, project_id=None):
         query = []
@@ -123,8 +121,6 @@ class Reports(object):
             query.append(dict(field="timestamp", op="gt", value=period_start))
         if period_end:
             query.append(dict(field="timestamp", op="lt", value=period_end))
-        if project_id:
-            query.append(dict(field="project", op="eq", value=project_id))
         query.append(dict(field="metadata.state", op="eq", value="active"))
         return query
 
@@ -134,7 +130,7 @@ class Reports(object):
         hypervisors = self.nova.hypervisors.list()
         host_instances_count = {}
         for hypervisor in hypervisors:
-            host = hypervisor.hypervisor_hostname
+            host = hypervisor.service['host']
             host_query = [dict(field="metadata.instance_host", op="eq",
                                value=host)]
             statistics = self.cclient.statistics.list(
@@ -163,7 +159,8 @@ class Reports(object):
             reports = set(reports.split(","))
         bad_reports = reports - self.AVAILABLE_REPORTS
         if bad_reports:
-            Exception("Bad reports: %s", bad_reports)
+            logger.error("Bad reports: %s" % ', '.join(bad_reports))
+            sys.exit(1)
 
         result = {}
         for report in reports:
@@ -174,14 +171,13 @@ class Reports(object):
 def main():
     args = parser.parse_args()
     if not (args.period_start or args.period_end):
-        print ("Period not specified. "
-               "That means whole available statistics will be used")
+        logger.info("Period not specified. "
+                    "That means whole available statistics will be used")
     r = Reports(args.os_username, args.os_password, args.os_auth_url,
                 args.os_admin_project_name, args.os_user_domain_id,
                 args.os_project_domain_id, args.os_endpoint_type)
 
     result = r.get_reports(reports=args.reports,
-                           project_id=args.project_id,
                            period_start=args.period_start,
                            period_end=args.period_end)
     pprint.pprint(result)
