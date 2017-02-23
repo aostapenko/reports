@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import os
+import pprint
 
 from ceilometerclient import client as ceilometer_client
 from keystoneauth1 import discover
@@ -108,17 +109,12 @@ class Reports(object):
             query.append(dict(field="timestamp", op="lt", value=period_end))
         if project_id:
             query.append(dict(field="project", op="eq", value=project_id))
+        query.append(dict(field="metadata.state", op="eq", value="active"))
         return query
 
-    def _get_resource_ids(self, meter, query):
-        statistics = self.cclient.statistics.list(meter, q=query,
-                                                  groupby='resource_id')
-        return [entry.groupby['resource_id'] for entry in statistics]
-
     # considers migration case
-    def _host_instances_count(self, **query_kwargs):
+    def host_instances_count(self, **query_kwargs):
         query = self._get_query(**query_kwargs)
-        query.append(dict(field="metadata.state", op="eq", value="active"))
         hypervisors = self.nova.hypervisors.list()
         host_instances_count = {}
         for hypervisor in hypervisors:
@@ -130,8 +126,26 @@ class Reports(object):
             host_instances_count[host] = len(statistics)
         return host_instances_count
 
+    def used_flavors(self, **query_kwargs):
+        query = self._get_query(**query_kwargs)
+        statistics = self.cclient.statistics.list(
+            'instance',
+            q=query,
+            groupby=('resource_id', 'resource_metadata.instance_type')
+        )
+        instance_type_count = {}
+        for s in statistics:
+            instance_type = s.groupby['resource_metadata.instance_type']
+            instance_type_count.setdefault(instance_type, 0)
+            instance_type_count[instance_type] += 1
+        return instance_type_count
+
     def get_reports(self, **query_kwargs):
-        return self._host_instances_count(**query_kwargs)
+        result = {
+            "instance_host_count": self.host_instances_count(**query_kwargs),
+            "used_flavors": self.used_flavors(**query_kwargs),
+        }
+        return result
 
 
 def main():
@@ -146,7 +160,7 @@ def main():
     result = r.get_reports(project_id=args.project_id,
                            period_start=args.period_start,
                            period_end=args.period_end)
-    print result
+    pprint.pprint(result)
 
 
 if __name__ == "__main__":
