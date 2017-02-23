@@ -115,25 +115,6 @@ class Reports(object):
                                                   groupby='resource_id')
         return [entry.groupby['resource_id'] for entry in statistics]
 
-    def _host_instances_count_old(self, **query_kwargs):
-        query = self._get_query(**query_kwargs)
-        query.append(dict(field="metadata.state", op="eq", value="active"))
-        instance_ids = self._get_resource_ids('instance', query)
-        host_instances_count = {}
-        for instance_id in instance_ids:
-            resource_query = [dict(field="resource_id", op="eq",
-                                   value=instance_id)]
-            samples = self.cclient.samples.list(
-                'instance', q=query+resource_query, limit=1)
-            instance_host = (
-                samples[0].resource_metadata.get('instance_host') or
-                samples[0].resource_metadata.get('host'
-                    ).replace('compute.', '')
-            )
-            host_instances_count.setdefault(instance_host, 0)
-            host_instances_count[instance_host] += 1
-        return host_instances_count
-
     # considers migration case
     def _host_instances_count(self, **query_kwargs):
         query = self._get_query(**query_kwargs)
@@ -142,23 +123,22 @@ class Reports(object):
         host_instances_count = {}
         for hypervisor in hypervisors:
             host = hypervisor.hypervisor_hostname
-            # host???
-            host_query = [dict(field="metadata.instance_host", op="eq",
-                               value=host)]
+            host_query = [dict(field="metadata.host", op="eq",
+                               value='compute.'+host)]
             statistics = self.cclient.statistics.list(
                 'instance', q=query+host_query, groupby='resource_id')
             host_instances_count[host] = len(statistics)
         return host_instances_count
 
-
     def get_reports(self, **query_kwargs):
-        print self._host_instances_count_old(**query_kwargs)
-        print self._host_instances_count(**query_kwargs)
+        return self._host_instances_count(**query_kwargs)
 
 
 def main():
     args = parser.parse_args()
-
+    if not (args.period_start or args.period_end):
+        print ("Period not specified. "
+               "That means whole available statistics will be used")
     r = Reports(args.username, args.password, args.os_auth_url,
                 args.admin_project_name, args.user_domain_id,
                 args.project_domain_id, args.endpoint_type)
@@ -166,7 +146,7 @@ def main():
     result = r.get_reports(project_id=args.project_id,
                            period_start=args.period_start,
                            period_end=args.period_end)
-
+    print result
 
 
 if __name__ == "__main__":
