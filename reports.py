@@ -125,11 +125,16 @@ class Reports(object):
                                    value=instance_id)]
             samples = self.cclient.samples.list(
                 'instance', q=query+resource_query, limit=1)
-            instance_host = samples[0].resource_metadata.get('instance_host')
+            instance_host = (
+                samples[0].resource_metadata.get('instance_host') or
+                samples[0].resource_metadata.get('host'
+                    ).replace('compute.', '')
+            )
             host_instances_count.setdefault(instance_host, 0)
             host_instances_count[instance_host] += 1
         return host_instances_count
 
+    # considers migration case
     def _host_instances_count(self, **query_kwargs):
         query = self._get_query(**query_kwargs)
         query.append(dict(field="metadata.state", op="eq", value="active"))
@@ -137,6 +142,7 @@ class Reports(object):
         host_instances_count = {}
         for hypervisor in hypervisors:
             host = hypervisor.hypervisor_hostname
+            # host???
             host_query = [dict(field="metadata.instance_host", op="eq",
                                value=host)]
             statistics = self.cclient.statistics.list(
