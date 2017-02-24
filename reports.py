@@ -1,3 +1,4 @@
+import abc
 import argparse
 import logging
 import os
@@ -83,13 +84,25 @@ def _discover_auth_versions(session, auth_url):
     return v2_auth_url, v3_auth_url
 
 
-class Reports(object):
+class AbstractComputeReport(object):
+    __metaclass__ = abc.ABCMeta
 
-    AVAILABLE_REPORTS = set(['host_instances_count', 'used_flavors'])
+    @abc.abstractmethod
+    def used_flavors(self):
+        pass
+
+    @abc.abstractmethod
+    def host_instances_count(self):
+        pass
+
+
+class BaseComputeReport(AbstractComputeReport):
+
+    AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
 
     def __init__(self, username, password, auth_url, project_name,
                  user_domain_id=None, project_domain_id=None,
-                 endpoint_type='publicURL'):
+                 endpoint_type='publicURL', **kwargs):
         sess = session.Session()
         v2_auth_url, v3_auth_url = _discover_auth_versions(sess, auth_url)
         use_domain = user_domain_id or project_domain_id
@@ -115,18 +128,22 @@ class Reports(object):
         self.cclient = ceilometer_client.get_client(2, session=sess,
                                                     endpoint_type=endpoint_type)
 
-    def _get_query(self, period_start=None, period_end=None, project_id=None):
-        query = []
+
+class PeriodBasedComputeReport(BaseComputeReport):
+
+    def __init__(self, period_start=None, period_end=None, **kwargs):
+        super(PeriodBasedComputeReport, self).__init__(**kwargs)
+        self.query = self._get_query(period_start, period_end)
+
+    def _get_query(self, period_start=None, period_end=None):
+        query = [dict(field="metadata.state", op="eq", value="active")]
         if period_start:
             query.append(dict(field="timestamp", op="gt", value=period_start))
         if period_end:
             query.append(dict(field="timestamp", op="lt", value=period_end))
-        query.append(dict(field="metadata.state", op="eq", value="active"))
         return query
 
-    # considers migration case
-    def host_instances_count(self, **query_kwargs):
-        query = self._get_query(**query_kwargs)
+    def host_instances_count(self):
         hypervisors = self.nova.hypervisors.list()
         host_instances_count = {}
         for hypervisor in hypervisors:
@@ -134,15 +151,14 @@ class Reports(object):
             host_query = [dict(field="metadata.instance_host", op="eq",
                                value=host)]
             statistics = self.cclient.statistics.list(
-                'instance', q=query+host_query, groupby='resource_id')
+                'instance', q=self.query+host_query, groupby='resource_id')
             host_instances_count[host] = len(statistics)
         return host_instances_count
 
-    def used_flavors(self, **query_kwargs):
-        query = self._get_query(**query_kwargs)
+    def used_flavors(self):
         statistics = self.cclient.statistics.list(
             'instance',
-            q=query,
+            q=self.query,
             groupby=('resource_id', 'resource_metadata.instance_type')
         )
         instance_type_count = {}
@@ -152,34 +168,66 @@ class Reports(object):
             instance_type_count[instance_type] += 1
         return instance_type_count
 
-    def get_reports(self, reports, **query_kwargs):
-        if reports == 'all':
-            reports = self.AVAILABLE_REPORTS
-        else:
-            reports = set(reports.split(","))
-        bad_reports = reports - self.AVAILABLE_REPORTS
-        if bad_reports:
-            logger.error("Bad reports: %s" % ', '.join(bad_reports))
-            sys.exit(1)
 
-        result = {}
-        for report in reports:
-            result[report] = getattr(self, report)(**query_kwargs)
-        return result
+class CurrentStateComputeReport(BaseComputeReport):
+
+    def __init__(self, **kwargs):
+        super(CurrentStateComputeReport, self).__init__(**kwargs)
+        self._instance_list = None
+
+    @property
+    def instance_list(self):
+        if self._instance_list is None:
+            self._instance_list = self.nova.servers.list(limit=-1)
+        return self._instance_list
+
+    def host_instances_count(self):
+        hypervisors = self.nova.hypervisors.list()
+        host_instances_count = {h.service['host']: 0 for h in hypervisors}
+        for instance in self.instance_list:
+            host = instance.to_dict()['OS-EXT-SRV-ATTR:host']
+            host_instances_count[host] += 1
+        return host_instances_count
+
+    def used_flavors(self):
+        flavors = {f.id: f.name for f in self.nova.flavors.list()}
+        instance_type_count = {}
+        for instance in self.instance_list:
+            flavor_name = flavors[instance.flavor['id']]
+            instance_type_count.setdefault(flavor_name, 0)
+            instance_type_count[flavor_name] += 1
+        return instance_type_count
 
 
 def main():
     args = parser.parse_args()
-    if not (args.period_start or args.period_end):
-        logger.info("Period not specified. "
-                    "That means whole available statistics will be used")
-    r = Reports(args.os_username, args.os_password, args.os_auth_url,
-                args.os_admin_project_name, args.os_user_domain_id,
-                args.os_project_domain_id, args.os_endpoint_type)
+    if args.period_start or args.period_end:
+        compute_reports_class = PeriodBasedComputeReport
+    else:
+        compute_reports_class = CurrentStateComputeReport
+        logger.info("Period not specified. Current state report will be made.")
 
-    result = r.get_reports(reports=args.reports,
-                           period_start=args.period_start,
-                           period_end=args.period_end)
+    r = compute_reports_class(
+         username=args.os_username, password=args.os_password,
+         auth_url=args.os_auth_url, project_name=args.os_admin_project_name,
+         user_domain_id=args.os_user_domain_id,
+         project_domain_id=args.os_project_domain_id,
+         endpoint_type=args.os_endpoint_type,
+         period_start=args.period_start, period_end=args.period_end)
+    reports = args.reports
+    if reports == 'all':
+        reports = r.AVAILABLE_REPORTS
+    else:
+        reports = reports.split(",")
+    bad_reports = set(reports) - set(r.AVAILABLE_REPORTS)
+    if bad_reports:
+        logger.error("Bad reports: %s" % ', '.join(bad_reports))
+        sys.exit(1)
+
+    result = {}
+    for report in reports:
+        result[report] = getattr(r, report)()
+
     pprint.pprint(result)
 
 
