@@ -1,4 +1,3 @@
-import abc
 import argparse
 import logging
 import os
@@ -21,7 +20,7 @@ logger.setLevel(logging.INFO)
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--report",
+parser.add_argument("--report_type",
                     default='all',
                     choices=['all', 'os_report', 'infra_report'],
                     help="Reports to make. Default: all")
@@ -82,19 +81,18 @@ def _discover_auth_versions(session, auth_url):
     return v2_auth_url, v3_auth_url
 
 
-class AbstractComputeReport(object):
-    __metaclass__ = abc.ABCMeta
+class BaseReport(object):
 
-    @abc.abstractmethod
-    def used_flavors(self):
-        pass
+    AVAILABLE_REPORTS = ()
 
-    @abc.abstractmethod
-    def host_instances_count(self):
-        pass
+    def get_reports(self):
+        result = {}
+        for report in self.AVAILABLE_REPORTS:
+            result[report] = getattr(self, report)()
+        return result
 
 
-class BaseComputeReport(AbstractComputeReport):
+class BaseComputeReport(BaseReport):
 
     AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
 
@@ -197,7 +195,7 @@ class CurrentStateComputeReport(BaseComputeReport):
         return instance_type_count
 
 
-REPORTS_MAP = {
+REPORT_TYPES_MAP = {
     'period': {'os_report': PeriodBasedComputeReport},
     'current': {'os_report': CurrentStateComputeReport},
 }
@@ -206,21 +204,20 @@ REPORTS_MAP = {
 def main():
     args = parser.parse_args()
     if args.period_start or args.period_end:
-        report_classes_map = REPORTS_MAP['period']
+        report_types_map = REPORT_TYPES_MAP['period']
     else:
         logger.info("Period not specified. Current state report will be made.")
-        report_classes_map = REPORTS_MAP['current']
+        report_types_map = REPORT_TYPES_MAP['current']
 
-    if args.report == 'all':
-        report_classes = report_classes_map.values()
+    if args.report_type == 'all':
+        report_types = report_types_map.keys()
     else:
-        report_classes = (report_classes_map[args.report],)
+        report_types = (args.report_type,)
 
-    for cls in report_classes:
-        r = cls(**args.__dict__)
-        result = {}
-        for report in r.AVAILABLE_REPORTS:
-            result[report] = getattr(r, report)()
+    result = {}
+    for report_type in report_types:
+        r = report_types_map[report_type](**args.__dict__)
+        result[report_type] = r.get_reports()
 
     pprint.pprint(result)
 
