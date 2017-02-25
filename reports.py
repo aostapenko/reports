@@ -21,12 +21,10 @@ logger.setLevel(logging.INFO)
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--reports",
+parser.add_argument("--report",
                     default='all',
-                    help="Report to make. Choose from: all, used_flavors, "
-                         "host_instances_count, nova_api_request_rate, "
-                         "swift_api_request_rate, storage_io. Can be "
-                         "specified several using comma. Default: all")
+                    choices=['all', 'os_report', 'infra_report'],
+                    help="Reports to make. Default: all")
 parser.add_argument("--os_username",
                     default=os.environ.get("OS_USERNAME", "admin"),
                     help="Name of the user")
@@ -41,7 +39,7 @@ parser.add_argument("--os_endpoint_type",
                     default=os.environ.get("OS_ENDPOINT_TYPE",
                                            "internalURL"),
                     help="Endpoint type")
-parser.add_argument("--os_admin_project_name",
+parser.add_argument("--os_project_name",
                     default=os.environ.get("OS_PROJECT_NAME", "admin"),
                     help="Name of admin project for auth")
 parser.add_argument("--os_user_domain_id",
@@ -100,23 +98,23 @@ class BaseComputeReport(AbstractComputeReport):
 
     AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
 
-    def __init__(self, username, password, auth_url, project_name,
-                 user_domain_id=None, project_domain_id=None,
-                 endpoint_type='publicURL', **kwargs):
+    def __init__(self, os_username, os_password, os_auth_url, os_project_name,
+                 os_user_domain_id=None, os_project_domain_id=None,
+                 os_endpoint_type='publicURL', **kwargs):
         sess = session.Session()
-        v2_auth_url, v3_auth_url = _discover_auth_versions(sess, auth_url)
-        use_domain = user_domain_id or project_domain_id
+        v2_auth_url, v3_auth_url = _discover_auth_versions(sess, os_auth_url)
+        use_domain = os_user_domain_id or os_project_domain_id
         use_v3 = v3_auth_url and (use_domain or (not v2_auth_url))
         use_v2 = v2_auth_url and not use_domain
 
         if use_v3:
-            auth = v3.Password(auth_url=v3_auth_url, username=username,
-                               password=password, project_name=project_name,
-                               user_domain_id=user_domain_id,
-                               project_domain_id=project_domain_id)
+            auth = v3.Password(auth_url=v3_auth_url, username=os_username,
+                               password=os_password, project_name=os_project_name,
+                               user_domain_id=os_user_domain_id,
+                               project_domain_id=os_project_domain_id)
         elif use_v2:
-            auth = v2.Password(v2_auth_url, username, password,
-                               tenant_name=project_name)
+            auth = v2.Password(v2_auth_url, os_username, os_password,
+                               tenant_name=os_project_name)
         else:
             raise Exception('Unable to determine the Keystone version '
                             'to authenticate with using the given auth_url.')
@@ -124,9 +122,9 @@ class BaseComputeReport(AbstractComputeReport):
         sess.auth = auth
         self.keystone = keystone_client.Client(session=sess)
         self.nova = nova_client.Client(2, session=sess,
-                                       endpoint_type=endpoint_type)
+                                       endpoint_type=os_endpoint_type)
         self.cclient = ceilometer_client.get_client(2, session=sess,
-                                                    endpoint_type=endpoint_type)
+                                                    endpoint_type=os_endpoint_type)
 
 
 class PeriodBasedComputeReport(BaseComputeReport):
@@ -199,34 +197,30 @@ class CurrentStateComputeReport(BaseComputeReport):
         return instance_type_count
 
 
+REPORTS_MAP = {
+    'period': {'os_report': PeriodBasedComputeReport},
+    'current': {'os_report': CurrentStateComputeReport},
+}
+
+
 def main():
     args = parser.parse_args()
     if args.period_start or args.period_end:
-        compute_reports_class = PeriodBasedComputeReport
+        report_classes_map = REPORTS_MAP['period']
     else:
-        compute_reports_class = CurrentStateComputeReport
         logger.info("Period not specified. Current state report will be made.")
+        report_classes_map = REPORTS_MAP['current']
 
-    r = compute_reports_class(
-         username=args.os_username, password=args.os_password,
-         auth_url=args.os_auth_url, project_name=args.os_admin_project_name,
-         user_domain_id=args.os_user_domain_id,
-         project_domain_id=args.os_project_domain_id,
-         endpoint_type=args.os_endpoint_type,
-         period_start=args.period_start, period_end=args.period_end)
-    reports = args.reports
-    if reports == 'all':
-        reports = r.AVAILABLE_REPORTS
+    if args.report == 'all':
+        report_classes = report_classes_map.values()
     else:
-        reports = reports.split(",")
-    bad_reports = set(reports) - set(r.AVAILABLE_REPORTS)
-    if bad_reports:
-        logger.error("Bad reports: %s" % ', '.join(bad_reports))
-        sys.exit(1)
+        report_classes = (report_classes_map[args.report],)
 
-    result = {}
-    for report in reports:
-        result[report] = getattr(r, report)()
+    for cls in report_classes:
+        r = cls(**args.__dict__)
+        result = {}
+        for report in r.AVAILABLE_REPORTS:
+            result[report] = getattr(r, report)()
 
     pprint.pprint(result)
 
