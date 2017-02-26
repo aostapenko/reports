@@ -92,27 +92,44 @@ class BaseReport(object):
         return result
 
 
+def cut_var_name(prefix):
+    # adapter between script and class arguments
+    def decorator(f):
+        def wrapper(self, **kwargs):
+            new_kwargs = {}
+            for k, v in kwargs.items():
+                if k.startswith(prefix):
+                   new_kwargs[k.replace(prefix, '', 1)] = v
+                else:
+                   new_kwargs[k] = v
+            return f(self, **new_kwargs)
+        return wrapper
+    return decorator
+
+
 class BaseComputeReport(BaseReport):
 
     AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
 
-    def __init__(self, os_username, os_password, os_auth_url, os_project_name,
-                 os_user_domain_id=None, os_project_domain_id=None,
-                 os_endpoint_type='publicURL', **kwargs):
+    @cut_var_name('os_')
+    def __init__(self, username, password, auth_url, project_name,
+                 user_domain_id=None, project_domain_id=None,
+                 endpoint_type='publicURL', **kwargs):
+        super(BaseComputeReport, self).__init__()
         sess = session.Session()
-        v2_auth_url, v3_auth_url = _discover_auth_versions(sess, os_auth_url)
-        use_domain = os_user_domain_id or os_project_domain_id
+        v2_auth_url, v3_auth_url = _discover_auth_versions(sess, auth_url)
+        use_domain = user_domain_id or project_domain_id
         use_v3 = v3_auth_url and (use_domain or (not v2_auth_url))
         use_v2 = v2_auth_url and not use_domain
 
         if use_v3:
-            auth = v3.Password(auth_url=v3_auth_url, username=os_username,
-                               password=os_password, project_name=os_project_name,
-                               user_domain_id=os_user_domain_id,
-                               project_domain_id=os_project_domain_id)
+            auth = v3.Password(auth_url=v3_auth_url, username=username,
+                               password=password, project_name=project_name,
+                               user_domain_id=user_domain_id,
+                               project_domain_id=project_domain_id)
         elif use_v2:
-            auth = v2.Password(v2_auth_url, os_username, os_password,
-                               tenant_name=os_project_name)
+            auth = v2.Password(v2_auth_url, username, password,
+                               tenant_name=project_name)
         else:
             raise Exception('Unable to determine the Keystone version '
                             'to authenticate with using the given auth_url.')
@@ -120,9 +137,9 @@ class BaseComputeReport(BaseReport):
         sess.auth = auth
         self.keystone = keystone_client.Client(session=sess)
         self.nova = nova_client.Client(2, session=sess,
-                                       endpoint_type=os_endpoint_type)
+                                       endpoint_type=endpoint_type)
         self.cclient = ceilometer_client.get_client(2, session=sess,
-                                                    endpoint_type=os_endpoint_type)
+                                                    endpoint_type=endpoint_type)
 
 
 class PeriodBasedComputeReport(BaseComputeReport):
