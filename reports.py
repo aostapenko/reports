@@ -1,10 +1,13 @@
 import argparse
+import calendar
 import logging
 import os
 import pprint
 import sys
+import time
 
 from ceilometerclient import client as ceilometer_client
+from influxdb import InfluxDBClient
 from keystoneauth1 import discover
 from keystoneauth1.identity import v2
 from keystoneauth1.identity import v3
@@ -51,16 +54,24 @@ parser.add_argument("--period_start",
 parser.add_argument("--period_end",
                     help="Time when period ends in format "
                          "<YYYY-MM-DDThh:mm:ss> e.g. 2017-01-13T00:00:00")
+parser.add_argument("--period",
+                    default='1h',
+                    choices=['1m', '1h', '1d'],
+                    help="Period to use. Default: 1h")
+parser.add_argument("--use_time_boundaries",
+                    action='store_true',
+                    default=False,
+                    help="If true, InfluxDB time boundaries will be used")
 
 parser.add_argument("--influxdb_host",
                     default=os.environ.get("INFLUXDB_HOST",
-                                           "localhost"),
+                                           "172.16.107.4"),
                     help="InfluxDB host")
 parser.add_argument("--influxdb_port",
                     default=os.environ.get("INFLUXDB_PORT",
                                            "8086"),
                     help="InfluxDB port")
-parser.add_argument("--influxdb_db_name",
+parser.add_argument("--influxdb_dbname",
                     default=os.environ.get("INFLUXDB_DB_NAME",
                                            "lma"),
                     help="InfluxDB database name")
@@ -70,7 +81,7 @@ parser.add_argument("--influxdb_user",
                     help="InfluxDB user")
 parser.add_argument("--influxdb_password",
                     default=os.environ.get("INFLUXDB_PASSWORD",
-                                           "secret"),
+                                           "ieFrFc7An2ooWGBE8FTGGn7y"),
                     help="InfluxDB password")
 
 
@@ -98,10 +109,8 @@ def cut_var_name(prefix):
         def wrapper(self, **kwargs):
             new_kwargs = {}
             for k, v in kwargs.items():
-                if k.startswith(prefix):
-                   new_kwargs[k.replace(prefix, '', 1)] = v
-                else:
-                   new_kwargs[k] = v
+                k = k.replace(prefix, '', 1) if k.startswith(prefix) else k
+                new_kwargs[k] = v
             return f(self, **new_kwargs)
         return wrapper
     return decorator
@@ -191,6 +200,7 @@ class CurrentStateComputeReport(BaseComputeReport):
     @property
     def instance_list(self):
         if self._instance_list is None:
+            # no pagination yet
             self._instance_list = self.nova.servers.list(limit=-1)
         return self._instance_list
 
@@ -212,9 +222,85 @@ class CurrentStateComputeReport(BaseComputeReport):
         return instance_type_count
 
 
+class InfrastructureReport(BaseReport):
+
+    AVAILABLE_REPORTS = ('nova_api_requests',)# 'swift_api_requests', 'storage_io')
+    TIME_MAP = {'1m': 60,
+                '1h': 3600,
+                '1d': 86400,}
+
+    @cut_var_name('influxdb_')
+    def __init__(self, host, port, user, password, dbname,
+                 period_start=None, period_end=None,
+                 period='1h', use_time_boundaries=False, **kwargs):
+        super(InfrastructureReport, self).__init__()
+        self.period = period
+        self.gb_offset = 0
+        self.use_time_boundaries = use_time_boundaries
+        self._setup_time_args(period_start, period_end, period)
+        self.client = InfluxDBClient(host, port, user, password, dbname)
+
+    def nova_api_requests(self):
+        query=self._get_query('openstack_nova_http_response_times')
+        return self.client.query(query=query)
+
+    def _adapt_format(self, period):
+        if not period:
+            return
+        return period if period.endswith('Z') else period + 'Z'
+
+    def _setup_time_args(self, period_start, period_end, period):
+        period_start = self._adapt_format(period_start)
+        period_end = self._adapt_format(period_end)
+
+        # we need this logic to consider script execution time to take
+        # exactly 1 hour statistics when period is not specified
+        if period_end:
+            self.period_end = period_end
+            period_end_struct = time.strptime(period_end, TIME_FORMAT)
+        else:
+            current_time = time.time()
+            period_end_struct = time.gmtime(current_time)
+            self.period_end = time.strftime(TIME_FORMAT, period_end_struct)
+
+        if period_start:
+            self.period_start = period_start
+            period_start_struct = time.strptime(period_start, TIME_FORMAT)
+        else:
+            period_start_struct = time.gmtime(
+                calendar.timegm(period_end_struct)-self.TIME_MAP[self.period])
+            self.period_start = time.strftime(TIME_FORMAT, period_start_struct)
+
+        # period logic may be improved to support different periods
+        if not self.use_time_boundaries:
+            self.gb_offset = period_start_struct.tm_sec
+            if self.period in ('1h', '1d'):
+                self.gb_offset += period_start_struct.tm_min * 60
+            if self.period == '1d':
+                self.gb_offset += period_start_struct.tm_hour * 3600
+
+    def _get_query(self, measure):
+        query = 'SELECT sum("count") FROM %s' % measure
+        query += (
+            ' WHERE "time" >= \'%(period_start)s\''
+            ' AND "time" < \'%(period_end)s\''
+            ' GROUP BY time(%(period)s, %(gb_offset)ss)'
+        ) % self.__dict__
+
+        return query
+
+
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 REPORT_TYPES_MAP = {
-    'period': {'os_report': PeriodBasedComputeReport},
-    'current': {'os_report': CurrentStateComputeReport},
+    'period': {
+         'os_report': PeriodBasedComputeReport,
+         'infra_report': InfrastructureReport,
+    },
+    'current': {
+         'os_report': CurrentStateComputeReport,
+         'infra_report': InfrastructureReport,
+    },
 }
 
 
