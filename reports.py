@@ -62,6 +62,11 @@ parser.add_argument("--use_time_boundaries",
                     action='store_true',
                     default=False,
                     help="If true, InfluxDB time boundaries will be used")
+parser.add_argument("--status_codes",
+                    action='store_true',
+                    default=False,
+                    help="If true, api requests count will be additionally "
+                         "grouped by response status codes")
 
 parser.add_argument("--influxdb_host",
                     default=os.environ.get("INFLUXDB_HOST",
@@ -224,7 +229,7 @@ class CurrentStateComputeReport(BaseComputeReport):
 
 class InfrastructureReport(BaseReport):
 
-    AVAILABLE_REPORTS = ('nova_api_requests',)# 'swift_api_requests', 'storage_io')
+    AVAILABLE_REPORTS = ('nova_api_requests', 'host_instances_count', 'storage_api_requests')#, 'storage_io')
     TIME_MAP = {'1m': 60,
                 '1h': 3600,
                 '1d': 86400,}
@@ -232,17 +237,76 @@ class InfrastructureReport(BaseReport):
     @cut_var_name('influxdb_')
     def __init__(self, host, port, user, password, dbname,
                  period_start=None, period_end=None,
-                 period='1h', use_time_boundaries=False, **kwargs):
+                 period='1h', use_time_boundaries=False,
+                 status_codes=False, **kwargs):
         super(InfrastructureReport, self).__init__()
         self.period = period
         self.gb_offset = 0
+        self.status_codes = status_codes
         self.use_time_boundaries = use_time_boundaries
         self._setup_time_args(period_start, period_end, period)
         self.client = InfluxDBClient(host, port, user, password, dbname)
 
+    def _query(self, query):
+        return self.client.query(query=query).raw.get('series', [])
+
+    def host_instances_count(self):
+        query_string = self._get_query(
+            measurement='openstack_nova_running_instances',
+            select='mean("value")',
+            gb_tags=('hostname',))
+        query = self._query(query_string)
+        result = {}
+        for q in query:
+            values = q.get('values', [])
+            if not values:
+                continue
+            for value in values:
+                time, count = value
+                hostname = q['tags']['hostname']
+                result.setdefault(time, {})
+                result[time][hostname] = count
+        return result
+
     def nova_api_requests(self):
-        query=self._get_query('openstack_nova_http_response_times')
-        return self.client.query(query=query)
+        return self._request_count('nova-api')
+
+    def storage_api_requests(self):
+        return self._request_count('object-storage')
+
+    def _request_count(self, service):
+        results = {}
+        for i in range(1, 6):
+            response_code = '%sxx' % i
+            measurement = 'haproxy_backend_response_' + response_code
+            query = self._get_query(
+                measurement=measurement,
+                select='spread("value")',
+                where=("value > 0", "backend = '%s'" % service))
+            results[response_code] = [
+                {v[0]: v[1] for v in q.get('values', [])}
+                for q in self._query(query)
+            ]
+        for k, v in results.items():
+            results[k] = v[0] if v else {}
+
+        # swapping http_codes and time, removing 0 values
+        temp_results = {}
+        for status_code, d in results.items():
+            for t, count in d.items():
+                if not count:
+                    continue
+                temp_results.setdefault(t, {})
+                temp_results[t][status_code] = count
+        results = temp_results
+
+        if self.status_codes:
+            return results
+
+        # sum different status codes responses
+        for t, d in results.items():
+            results[t] = sum(d.values())
+        return results
 
     def _adapt_format(self, period):
         if not period:
@@ -279,14 +343,20 @@ class InfrastructureReport(BaseReport):
             if self.period == '1d':
                 self.gb_offset += period_start_struct.tm_hour * 3600
 
-    def _get_query(self, measure):
-        query = 'SELECT sum("count") FROM %s' % measure
+    def _get_query(self, measurement, select, where=None, gb_tags=None):
+        query = 'SELECT %s FROM %s WHERE ' % (select, measurement)
+        if where:
+            for w in where:
+                query += w + " AND "
         query += (
-            ' WHERE "time" >= \'%(period_start)s\''
-            ' AND "time" < \'%(period_end)s\''
+            'time >= \'%(period_start)s\''
+            ' AND time < \'%(period_end)s\''
             ' GROUP BY time(%(period)s, %(gb_offset)ss)'
         ) % self.__dict__
-
+        if gb_tags:
+            for tag in gb_tags:
+                query += ',%s' % tag
+        query += ' fill(0)'
         return query
 
 
