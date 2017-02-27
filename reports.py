@@ -25,7 +25,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--report_type",
                     default='all',
-                    choices=['all', 'os_report', 'infra_report'],
+                    choices=['all', 'os_report', 'influxdb_report'],
                     help="Reports to make. Default: all")
 parser.add_argument("--os_username",
                     default=os.environ.get("OS_USERNAME", "admin"),
@@ -229,7 +229,13 @@ class CurrentStateComputeReport(BaseComputeReport):
 
 class InfrastructureReport(BaseReport):
 
-    AVAILABLE_REPORTS = ('nova_api_requests', 'host_instances_count', 'storage_api_requests')#, 'storage_io')
+    AVAILABLE_REPORTS = (
+        'nova_api_requests',
+        'host_instances_count',
+        'object_storage_api_requests',
+        'block_storage_api_requests',
+        'storage_io',
+    )
     TIME_MAP = {'1m': 60,
                 '1h': 3600,
                 '1d': 86400,}
@@ -250,10 +256,73 @@ class InfrastructureReport(BaseReport):
     def _query(self, query):
         return self.client.query(query=query).raw.get('series', [])
 
+    def storage_io(self):
+        result = self._pool_rates()
+        osd_perf_report = self._osd_perf()
+        for k, v in result.items():
+            v.update(osd_perf_report.get(k, {}))
+        return result
+
+    def _osd_perf(self):
+        measurements = (
+            'ceph_perf_osd_op_r',
+            'ceph_perf_osd_op_r_out_bytes',
+            'ceph_perf_osd_op_r_latency',
+            'ceph_perf_osd_op_r_process_latency',
+            'ceph_perf_osd_op_w',
+            'ceph_perf_osd_op_w_latency',
+            'ceph_perf_osd_op_w_in_bytes',
+            'ceph_perf_osd_op_w_process_latency',
+        )
+        result = {}
+        for measurement in measurements:
+            query_string = self._get_query(
+                measurement=measurement,
+                select='sum(value), max(value)',
+                gb_tags=('pool',))
+            query = self._query(query_string)
+            res = {}
+            for q in query:
+                values = q.get('values', [])
+                if not values:
+                    continue
+                for value in values:
+                    time, mean, max  = value
+                    result.setdefault(time, {})
+                    result[time].setdefault(measurement, {})
+                    result[time][measurement] = {'average': mean,
+                                                 'maximum': max}
+        return result
+
+    # B/s, B/s, ob/s
+    def _pool_rates(self):
+        measurements = ('ceph_pool_bytes_rate_tx',
+                        'ceph_pool_bytes_rate_rx',
+                        'ceph_pool_ops_rate')
+        result = {}
+        for measurement in measurements:
+            query_string = self._get_query(
+                measurement=measurement,
+                select='mean(value), max(value)',
+                gb_tags=('pool',))
+            query = self._query(query_string)
+            for q in query:
+                values = q.get('values', [])
+                if not values:
+                    continue
+                for value in values:
+                    time, mean, max  = value
+                    pool = q['tags']['pool']
+                    result.setdefault(time, {})
+                    result[time].setdefault(measurement, {})
+                    result[time][measurement][pool] = {'average': mean,
+                                                       'maximum': max}
+        return result
+
     def host_instances_count(self):
         query_string = self._get_query(
             measurement='openstack_nova_running_instances',
-            select='mean("value")',
+            select='mean(value), max(value)',
             gb_tags=('hostname',))
         query = self._query(query_string)
         result = {}
@@ -262,16 +331,19 @@ class InfrastructureReport(BaseReport):
             if not values:
                 continue
             for value in values:
-                time, count = value
+                time, mean, max  = value
                 hostname = q['tags']['hostname']
                 result.setdefault(time, {})
-                result[time][hostname] = count
+                result[time][hostname] = {'average': mean, 'maximum': max}
         return result
 
     def nova_api_requests(self):
         return self._request_count('nova-api')
 
-    def storage_api_requests(self):
+    def block_storage_api_requests(self):
+        return self._request_count('cinder-api')
+
+    def object_storage_api_requests(self):
         return self._request_count('object-storage')
 
     def _request_count(self, service):
@@ -365,11 +437,11 @@ TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 REPORT_TYPES_MAP = {
     'period': {
          'os_report': PeriodBasedComputeReport,
-         'infra_report': InfrastructureReport,
+         'influxdb_report': InfrastructureReport,
     },
     'current': {
          'os_report': CurrentStateComputeReport,
-         'infra_report': InfrastructureReport,
+         'influxdb_report': InfrastructureReport,
     },
 }
 
