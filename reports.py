@@ -299,7 +299,7 @@ class InfrastructureReport(BaseReport):
 #        )
 
     def _process_query(self, query, keys, tag_key=None, tag_value=None,
-                       metric=None):
+                       metric=None, gb_time=False):
         result = {}
         if metric:
             keys = [':'.join([metric, key]) for key in keys]
@@ -310,6 +310,9 @@ class InfrastructureReport(BaseReport):
                 tag = q.get('tags', {}).get(tag_key) or tag_value
                 if tag:
                     prepared_values = {tag: prepared_values}
+                if gb_time:
+                    time = value[0]
+                    prepared_values = {time: prepared_values}
                 result.update(prepared_values)
         return result
 
@@ -371,20 +374,23 @@ class InfrastructureReport(BaseReport):
             query_string = self._compile_query(
                 measurement=measurement,
                 select=aggregates,
-                where=("value > 0", "backend = '%s'" % service))
+                where=("value > 0", "backend = '%s'" % service),
+                gb_period='1h')
             query = self._query(query_string)
             res = self._process_query(
-                query, ('number', ), metric=response_code)
+                query, ('number',), metric=response_code, gb_time=True)
             result.update(res)
 
         if self.status_codes:
             return result
 
         # sum different status codes responses
-        result = {'number': sum(result.values())}
+        for t, d in result.items():
+            result[t] = sum(d.values())
         return result
 
-    def _compile_query(self, measurement, select, where=None, gb_tag=None):
+    def _compile_query(self, measurement, select, where=None, gb_tag=None,
+                       gb_period=None):
         if isinstance(select, dict):
             select = ", ".join(["%s(%s)" % (a, v) for a, v in select.items()])
         query = "SELECT %s FROM %s WHERE " % (select, measurement)
@@ -394,8 +400,9 @@ class InfrastructureReport(BaseReport):
         query += (
             "time >= '%(period_start)s'"
             " AND time < '%(period_end)s'"
-            " GROUP BY time(%(gb_period)s)"
         ) % self.__dict__
+        gb_period = gb_period or self.gb_period
+        query += " GROUP BY time(%s)" % gb_period
         if gb_tag:
             query += ",%s" % gb_tag
         query += " fill(0)"
@@ -435,7 +442,6 @@ def write_cvs_report(report):
     else:
         dir_idx = 1
     os.mkdir(os.path.join(reports_dir, 'report-%s' % dir_idx))
-    influxdb_reports = []
 
 
 def main():
