@@ -379,7 +379,9 @@ class InfrastructureReport(BaseReport):
             query = self._query(query_string)
             res = self._process_query(
                 query, ('number',), metric=response_code, gb_time=True)
-            result.update(res)
+            for t, d in res.items():
+                result.setdefault(t, {})
+                result[t].update(d)
 
         if self.status_codes:
             return result
