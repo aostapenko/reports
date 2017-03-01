@@ -1,5 +1,6 @@
 import argparse
 import calendar
+import csv
 import logging
 import os
 import pprint
@@ -25,7 +26,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--report_type",
                     default='all',
-                    choices=['all', 'os_report', 'infra_report'],
+                    choices=['all', 'os_report', 'influxdb_report'],
                     help="Reports to make. Default: all")
 parser.add_argument("--os_username",
                     default=os.environ.get("OS_USERNAME", "admin"),
@@ -57,11 +58,8 @@ parser.add_argument("--period_end",
 parser.add_argument("--period",
                     default='1h',
                     choices=['1m', '1h', '1d'],
-                    help="Period to use. Default: 1h")
-parser.add_argument("--use_time_boundaries",
-                    action='store_true',
-                    default=False,
-                    help="If true, InfluxDB time boundaries will be used")
+                    help="Period to use if period_start or period_end "
+                         "not specified. Default: 1h")
 parser.add_argument("--status_codes",
                     action='store_true',
                     default=False,
@@ -103,8 +101,9 @@ class BaseReport(object):
 
     def get_reports(self):
         result = {}
-        for report in self.AVAILABLE_REPORTS:
-            result[report] = getattr(self, report)()
+        for method in self.AVAILABLE_REPORTS:
+            report = self.REPORT_NAME_TEMPLATE % method
+            result[report] = getattr(self, method)()
         return result
 
 
@@ -122,8 +121,6 @@ def cut_var_name(prefix):
 
 
 class BaseComputeReport(BaseReport):
-
-    AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
 
     @cut_var_name('os_')
     def __init__(self, username, password, auth_url, project_name,
@@ -155,32 +152,29 @@ class BaseComputeReport(BaseReport):
         self.cclient = ceilometer_client.get_client(2, session=sess,
                                                     endpoint_type=endpoint_type)
 
-
+# TODO Remove time from output
+# TODO Rename
 class PeriodBasedComputeReport(BaseComputeReport):
+
+    AVAILABLE_REPORTS = (#'host_unique_instances_sum',
+                         'used_flavors',)
+    REPORT_NAME_TEMPLATE = 'ceilometer__%s_per_period'
+
+    # TODO Make flexible periods
+    TIME_MAP = {'1m': 60,
+                '1h': 3600,
+                '1d': 86400,}
 
     def __init__(self, period_start=None, period_end=None, **kwargs):
         super(PeriodBasedComputeReport, self).__init__(**kwargs)
-        self.query = self._get_query(period_start, period_end)
+        self._setup_time_args(period_start, period_end)
+        self.query = self._get_query()
 
-    def _get_query(self, period_start=None, period_end=None):
+    def _get_query(self):
         query = [dict(field="metadata.state", op="eq", value="active")]
-        if period_start:
-            query.append(dict(field="timestamp", op="gt", value=period_start))
-        if period_end:
-            query.append(dict(field="timestamp", op="lt", value=period_end))
+        query.append(dict(field="timestamp", op="gt", value=self.period_start))
+        query.append(dict(field="timestamp", op="lt", value=self.period_end))
         return query
-
-    def host_instances_count(self):
-        hypervisors = self.nova.hypervisors.list()
-        host_instances_count = {}
-        for hypervisor in hypervisors:
-            host = hypervisor.service['host']
-            host_query = [dict(field="metadata.instance_host", op="eq",
-                               value=host)]
-            statistics = self.cclient.statistics.list(
-                'instance', q=self.query+host_query, groupby='resource_id')
-            host_instances_count[host] = len(statistics)
-        return host_instances_count
 
     def used_flavors(self):
         statistics = self.cclient.statistics.list(
@@ -195,8 +189,33 @@ class PeriodBasedComputeReport(BaseComputeReport):
             instance_type_count[instance_type] += 1
         return instance_type_count
 
+    def _setup_time_args(self, period_start, period_end):
+        period_start = _adapt_format(period_start)
+        period_end = _adapt_format(period_end)
+
+        # we need this logic to consider script execution time to take
+        # exactly 1 hour statistics when period is not specified
+        if period_end:
+            self.period_end = period_end
+            period_end_struct = time.strptime(period_end, TIME_FORMAT)
+        else:
+            current_time = time.time()
+            period_end_struct = time.gmtime(current_time)
+            self.period_end = time.strftime(TIME_FORMAT, period_end_struct)
+
+        if period_start:
+            self.period_start = period_start
+            period_start_struct = time.strptime(period_start, TIME_FORMAT)
+        else:
+            period_start_struct = time.gmtime(
+                calendar.timegm(period_end_struct)-self.TIME_MAP[self.period])
+            self.period_start = time.strftime(TIME_FORMAT, period_start_struct)
+
 
 class CurrentStateComputeReport(BaseComputeReport):
+
+    AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
+    REPORT_NAME_TEMPLATE = 'nova__%s'
 
     def __init__(self, **kwargs):
         super(CurrentStateComputeReport, self).__init__(**kwargs)
@@ -205,7 +224,7 @@ class CurrentStateComputeReport(BaseComputeReport):
     @property
     def instance_list(self):
         if self._instance_list is None:
-            # no pagination yet
+            # TODO Add pagination
             self._instance_list = self.nova.servers.list(limit=-1)
         return self._instance_list
 
@@ -227,9 +246,15 @@ class CurrentStateComputeReport(BaseComputeReport):
         return instance_type_count
 
 
+# TODO Rename
 class InfrastructureReport(BaseReport):
 
-    AVAILABLE_REPORTS = ('nova_api_requests', 'host_instances_count', 'storage_api_requests')#, 'storage_io')
+    AVAILABLE_REPORTS = (
+        'host_instances_count',
+        'api_services_request_count',
+        'storage_io',
+    )
+    REPORT_NAME_TEMPLATE = 'influxdb__%s_per_period'
     TIME_MAP = {'1m': 60,
                 '1h': 3600,
                 '1d': 86400,}
@@ -237,113 +262,154 @@ class InfrastructureReport(BaseReport):
     @cut_var_name('influxdb_')
     def __init__(self, host, port, user, password, dbname,
                  period_start=None, period_end=None,
-                 period='1h', use_time_boundaries=False,
-                 status_codes=False, **kwargs):
+                 period='1h', status_codes=False, **kwargs):
         super(InfrastructureReport, self).__init__()
         self.period = period
-        self.gb_offset = 0
+        self.gb_period = '1000y'
         self.status_codes = status_codes
-        self.use_time_boundaries = use_time_boundaries
-        self._setup_time_args(period_start, period_end, period)
+        self._setup_time_args(period_start, period_end)#, period)
         self.client = InfluxDBClient(host, port, user, password, dbname)
 
     def _query(self, query):
         return self.client.query(query=query).raw.get('series', [])
 
-    def host_instances_count(self):
-        query_string = self._get_query(
-            measurement='openstack_nova_running_instances',
-            select='mean("value")',
-            gb_tags=('hostname',))
-        query = self._query(query_string)
-        result = {}
-        for q in query:
-            values = q.get('values', [])
-            if not values:
-                continue
-            for value in values:
-                time, count = value
-                hostname = q['tags']['hostname']
-                result.setdefault(time, {})
-                result[time][hostname] = count
+    def storage_io(self):
+        result = self._pool_rates()
+#        osd_perf_report = self._osd_perf()
+#        for k, v in result.items():
+#            v.update(osd_perf_report.get(k, {}))
         return result
 
-    def nova_api_requests(self):
-        return self._request_count('nova-api')
+#    def _osd_perf(self):
+#        measurements = (
+#            'ceph_perf_osd_op_r',
+#            'ceph_perf_osd_op_r_out_bytes',
+#            'ceph_perf_osd_op_r_latency',
+#            'ceph_perf_osd_op_r_process_latency',
+#            'ceph_perf_osd_op_w',
+#            'ceph_perf_osd_op_w_latency',
+#            'ceph_perf_osd_op_w_in_bytes',
+#            'ceph_perf_osd_op_w_process_latency',
+#        )
 
-    def storage_api_requests(self):
-        return self._request_count('object-storage')
+    def _process_query(self, query, keys, tag_key=None, tag_value=None,
+                       metric=None):
+        result = {}
+        if metric:
+            keys = ['_'.join([metric, key]) for key in keys]
+        for q in query:
+            values = q.get('values', [])
+            for i, value in enumerate(values):
+                prepared_values = dict(zip(keys, value[1:]))
+                tag = q.get('tags', {}).get(tag_key) or tag_value
+                if tag:
+                    prepared_values = {tag: prepared_values}
+                result.update(prepared_values)
+        return result
 
+    # add units: B/s, B/s, op/s
+    def _pool_rates(self):
+        metrics = (
+            'ceph_pool_bytes_rate_tx',
+            'ceph_pool_bytes_rate_rx',
+            'ceph_pool_ops_rate',
+        )
+        result = {}
+        tag_key = 'pool'
+        aggregates = {'mean': 'value', 'max': 'value'}
+        for metric in metrics:
+            query_string = self._compile_query(
+                measurement=metric,
+                select=aggregates,
+                gb_tag=tag_key)
+            query = self._query(query_string)
+            res = self._process_query(
+                query, aggregates.keys(), tag_key=tag_key, metric=metric)
+            for k, v in res.items():
+                result.setdefault(k, {})
+                result[k].update(v)
+        return {'pools': result}
+
+    def host_instances_count(self):
+        aggregates = {'mean': 'value', 'max': 'value'}
+        tag_key = 'hostname'
+        query_string = self._compile_query(
+            measurement='openstack_nova_running_instances',
+            select=aggregates,
+            gb_tag=tag_key)
+        query = self._query(query_string)
+        result = self._process_query(query, aggregates.keys(), tag_key=tag_key)
+        return result
+
+    def api_services_request_count(self):
+        services = (
+            'nova-api',
+            'cinder-api',
+            'object-storage',
+            'glance-api',
+            'neutron-api',
+        )
+        result = {}
+        for service in services:
+            result[service] = self._request_count(service)
+        return result
+
+    # TODO Workaround issue with resetted counter
     def _request_count(self, service):
-        results = {}
+        result = {}
+        aggregates = {'spread': 'value'}
         for i in range(1, 6):
             response_code = '%sxx' % i
             measurement = 'haproxy_backend_response_' + response_code
-            query = self._get_query(
+            query_string = self._compile_query(
                 measurement=measurement,
-                select='spread("value")',
+                select=aggregates,
                 where=("value > 0", "backend = '%s'" % service))
-            results[response_code] = [
-                {v[0]: v[1] for v in q.get('values', [])}
-                for q in self._query(query)
-            ]
-        for k, v in results.items():
-            results[k] = v[0] if v else {}
-
-        # swapping http_codes and time, removing 0 values
-        temp_results = {}
-        for status_code, d in results.items():
-            for t, count in d.items():
-                if not count:
-                    continue
-                temp_results.setdefault(t, {})
-                temp_results[t][status_code] = count
-        results = temp_results
+            query = self._query(query_string)
+            res = self._process_query(
+                query, aggregates.keys(), metric=response_code)
+            result.update(res)
 
         if self.status_codes:
-            return results
+            return result
 
         # sum different status codes responses
-        for t, d in results.items():
-            results[t] = sum(d.values())
-        return results
+        result = sum(result.values())
+        return result
 
-    def _adapt_format(self, period):
-        if not period:
-            return
-        return period if period.endswith('Z') else period + 'Z'
-
-    def _setup_time_args(self, period_start, period_end, period):
-        period_start = self._adapt_format(period_start)
-        period_end = self._adapt_format(period_end)
+    # TODO Make flexible periods
+    # TODO Reuse method with compute class
+    def _setup_time_args(self, period_start, period_end):#, period):
+        period_start = _adapt_format(period_start)
+        period_end = _adapt_format(period_end)
 
         # we need this logic to consider script execution time to take
         # exactly 1 hour statistics when period is not specified
-        if period_end:
-            self.period_end = period_end
-            period_end_struct = time.strptime(period_end, TIME_FORMAT)
-        else:
-            current_time = time.time()
-            period_end_struct = time.gmtime(current_time)
-            self.period_end = time.strftime(TIME_FORMAT, period_end_struct)
-
         if period_start:
             self.period_start = period_start
             period_start_struct = time.strptime(period_start, TIME_FORMAT)
+            period_start_sec = calendar.timegm(period_start_struct)
+
+        if period_end:
+            self.period_end = period_end
+            period_end_struct = time.strptime(period_end, TIME_FORMAT)
+            period_end_sec = calendar.timegm(period_end_struct)
         else:
-            period_start_struct = time.gmtime(
-                calendar.timegm(period_end_struct)-self.TIME_MAP[self.period])
+            if period_start:
+                period_end_sec = period_start_sec + self.TIME_MAP[self.period]
+            else:
+                period_end_sec = time.time()
+            period_end_struct = time.gmtime(period_end_sec)
+            self.period_end = time.strftime(TIME_FORMAT, period_end_struct)
+
+        if not period_start:
+            period_start_sec = period_end_sec-self.TIME_MAP[self.period]
+            period_start_struct = time.gmtime(period_start_sec)
             self.period_start = time.strftime(TIME_FORMAT, period_start_struct)
 
-        # period logic may be improved to support different periods
-        if not self.use_time_boundaries:
-            self.gb_offset = period_start_struct.tm_sec
-            if self.period in ('1h', '1d'):
-                self.gb_offset += period_start_struct.tm_min * 60
-            if self.period == '1d':
-                self.gb_offset += period_start_struct.tm_hour * 3600
-
-    def _get_query(self, measurement, select, where=None, gb_tags=None):
+    def _compile_query(self, measurement, select, where=None, gb_tag=None):
+        if isinstance(select, dict):
+            select = ', '.join(['%s(%s)' % (a, v) for a, v in select.items()])
         query = 'SELECT %s FROM %s WHERE ' % (select, measurement)
         if where:
             for w in where:
@@ -351,13 +417,18 @@ class InfrastructureReport(BaseReport):
         query += (
             'time >= \'%(period_start)s\''
             ' AND time < \'%(period_end)s\''
-            ' GROUP BY time(%(period)s, %(gb_offset)ss)'
+            ' GROUP BY time(%(gb_period)s)'
         ) % self.__dict__
-        if gb_tags:
-            for tag in gb_tags:
-                query += ',%s' % tag
+        if gb_tag:
+            query += ',%s' % gb_tag
         query += ' fill(0)'
         return query
+
+
+def _adapt_format(t):
+    if not t:
+        return
+    return t if t.endswith('Z') else t + 'Z'
 
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -365,13 +436,29 @@ TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 REPORT_TYPES_MAP = {
     'period': {
          'os_report': PeriodBasedComputeReport,
-         'infra_report': InfrastructureReport,
+         'influxdb_report': InfrastructureReport,
     },
     'current': {
          'os_report': CurrentStateComputeReport,
-         'infra_report': InfrastructureReport,
+         'influxdb_report': InfrastructureReport,
     },
 }
+
+
+def write_cvs_report(report):
+    reports_dir = os.path.join(os.getcwd(), 'reports')
+    if not os.path.isdir(reports_dir):
+        os.mkdir(reports_dir)
+    report_dirs_list = [d for d in os.listdir(reports_dir)
+                        if d.startswith('report-')]
+    if report_dirs_list:
+        dir_idx = max([
+            int(d.split('-')[1])
+            for d in report_dirs_list]) + 1
+    else:
+        dir_idx = 1
+    os.mkdir(os.path.join(reports_dir, 'report-%s' % dir_idx))
+    influxdb_reports = []
 
 
 def main():
@@ -379,7 +466,6 @@ def main():
     if args.period_start or args.period_end:
         report_types_map = REPORT_TYPES_MAP['period']
     else:
-        logger.info("Period not specified. Current state report will be made.")
         report_types_map = REPORT_TYPES_MAP['current']
 
     if args.report_type == 'all':
@@ -387,12 +473,14 @@ def main():
     else:
         report_types = (args.report_type,)
 
-    result = {}
+    reports = {}
     for report_type in report_types:
         r = report_types_map[report_type](**args.__dict__)
-        result[report_type] = r.get_reports()
+        reports.update(r.get_reports())
 
-    pprint.pprint(result)
+    write_cvs_report(reports)
+
+    pprint.pprint(reports)
 
 
 if __name__ == "__main__":
