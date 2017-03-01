@@ -248,8 +248,8 @@ class PeriodBasedComputeReport(BaseComputeReport):
         instance_type_count = {}
         for s in statistics:
             instance_type = s.groupby['resource_metadata.instance_type']
-            instance_type_count.setdefault(instance_type, 0)
-            instance_type_count[instance_type] += 1
+            instance_type_count.setdefault(instance_type, {'instance_number': 0})
+            instance_type_count[instance_type]['instance_number'] += 1
         return instance_type_count
 
 
@@ -279,8 +279,8 @@ class InfrastructureReport(BaseReport):
         return self.client.query(query=query).raw.get('series', [])
 
     def storage_io(self):
-        result = []
-        result.append({'pools': self._pool_rates()})
+        result = self._pool_rates()
+#        result.append({'pools': self._pool_rates()})
 #        osd_perf_report = self._osd_perf()
 #        for k, v in result.items():
 #            v.update(osd_perf_report.get(k, {}))
@@ -361,7 +361,7 @@ class InfrastructureReport(BaseReport):
         )
         result = {}
         for service in services:
-            result[service] = self._request_count(service)
+            result.update(self._request_count(service))
         return result
 
     # TODO Workaround issue with resetted counter
@@ -378,18 +378,31 @@ class InfrastructureReport(BaseReport):
                 gb_period='1h')
             query = self._query(query_string)
             res = self._process_query(
-                query, ('number',), metric=response_code, gb_time=True)
+                query, ('request_number',),
+                metric=':'.join([service, response_code]),
+                gb_time=True)
             for t, d in res.items():
                 result.setdefault(t, {})
                 result[t].update(d)
 
+        def _swap_keys(dct):
+            res = {}
+            for t, d in dct.items():
+                for m, v in d.items():
+                    res.setdefault(m, {})
+                    res[m].setdefault(t, {})
+                    res[m][t] = v
+            return res
+
         if self.status_codes:
-            return result
+            return _swap_keys(result)
 
         # sum different status codes responses
+        res = {}
         for t, d in result.items():
-            result[t] = sum(d.values())
-        return result
+            res.setdefault(t, {})
+            res[t].update({service+':request_number': sum(d.values())})
+        return _swap_keys(res)
 
     def _compile_query(self, measurement, select, where=None, gb_tag=None,
                        gb_period=None):
@@ -431,20 +444,67 @@ REPORT_TYPES_MAP = {
 }
 
 
+#def write_cvs_report(report):
+#
+#    reports_dir = os.path.join(os.getcwd(), 'reports')
+#    if not os.path.isdir(reports_dir):
+#        os.mkdir(reports_dir)
+#    report_dirs_list = [d for d in os.listdir(reports_dir)
+#                        if d.startswith('report-')]
+#    if report_dirs_list:
+#        dir_idx = max([
+#            int(d.split('-')[1])
+#            for d in report_dirs_list]) + 1
+#    else:
+#        dir_idx = 1
+#    report_base_dir = os.path.join(reports_dir, 'report-%s' % dir_idx)
+#    os.mkdir(report_base_dir)
+#    for report_name, report_data in report.items():
+#       with open('%s.csv' % report_name, 'wb') as f:
+#           writer = csv.writer(f)
+#           sorted_columns = sorted(report_data.values()[0].keys())
+#           writer.writerow([''] + sorted_columns)
+#           for key in sorted(report_data.keys()):
+#               value = report_data[key]
+#               row = [key]
+#               if sorted_columns:
+#                   for column in sorted_columns:
+#                       row.append(value[column])
+#               else:
+#                   row.append(value)
+#               writer.writerow(row)
+
+
 def write_cvs_report(report):
+
     reports_dir = os.path.join(os.getcwd(), 'reports')
     if not os.path.isdir(reports_dir):
         os.mkdir(reports_dir)
-    report_dirs_list = [d for d in os.listdir(reports_dir)
-                        if d.startswith('report-')]
-    if report_dirs_list:
-        dir_idx = max([
-            int(d.split('-')[1])
-            for d in report_dirs_list]) + 1
+    report_files_list = [f for f in os.listdir(reports_dir)
+                         if f.startswith('report-')]
+    if report_files_list:
+        file_idx = max([
+            int(f.split('-')[1])
+            for f in report_files_list]) + 1
     else:
-        dir_idx = 1
-    os.mkdir(os.path.join(reports_dir, 'report-%s' % dir_idx))
-
+        file_idx = 1
+    report_file_path = os.path.join(reports_dir, 'report-%s.csv' % file_idx)
+    with open(report_file_path, 'wb') as f:
+        writer = csv.writer(f)
+        for report_name, report_data in report.items():
+           writer.writerow([report_name])
+           sorted_columns = sorted(report_data.values()[0].keys())
+           writer.writerow([''] + sorted_columns)
+           for key in sorted(report_data.keys()):
+               value = report_data[key]
+               row = [key]
+               if sorted_columns:
+                   for column in sorted_columns:
+                       row.append(value[column])
+               else:
+                   row.append(value)
+               writer.writerow(row)
+           writer.writerow([''])
 
 def main():
     args = parser.parse_args()
@@ -463,9 +523,9 @@ def main():
         r = report_types_map[report_type](**args.__dict__)
         reports.update(r.get_reports())
 
-    write_cvs_report(reports)
 
     pprint.pprint(reports)
+    write_cvs_report(reports)
 
 
 if __name__ == "__main__":
