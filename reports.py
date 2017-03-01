@@ -152,64 +152,37 @@ class BaseComputeReport(BaseReport):
         self.cclient = ceilometer_client.get_client(2, session=sess,
                                                     endpoint_type=endpoint_type)
 
-# TODO Remove time from output
-# TODO Rename
-class PeriodBasedComputeReport(BaseComputeReport):
-
-    AVAILABLE_REPORTS = (#'host_unique_instances_sum',
-                         'used_flavors',)
-    REPORT_NAME_TEMPLATE = 'ceilometer__%s_per_period'
-
+# TODO Make flexible periods
+def _calculate_time_borders(period_start, period_end, period):
     # TODO Make flexible periods
     TIME_MAP = {'1m': 60,
                 '1h': 3600,
                 '1d': 86400,}
+    period_start = _adapt_format(period_start)
+    period_end = _adapt_format(period_end)
 
-    def __init__(self, period_start=None, period_end=None, **kwargs):
-        super(PeriodBasedComputeReport, self).__init__(**kwargs)
-        self._setup_time_args(period_start, period_end)
-        self.query = self._get_query()
+    # we need this logic to consider script execution time to take
+    # exactly 1 hour statistics when period is not specified
+    if period_start:
+        period_start_struct = time.strptime(period_start, TIME_FORMAT)
+        period_start_sec = calendar.timegm(period_start_struct)
 
-    def _get_query(self):
-        query = [dict(field="metadata.state", op="eq", value="active")]
-        query.append(dict(field="timestamp", op="gt", value=self.period_start))
-        query.append(dict(field="timestamp", op="lt", value=self.period_end))
-        return query
-
-    def used_flavors(self):
-        statistics = self.cclient.statistics.list(
-            'instance',
-            q=self.query,
-            groupby=('resource_id', 'resource_metadata.instance_type')
-        )
-        instance_type_count = {}
-        for s in statistics:
-            instance_type = s.groupby['resource_metadata.instance_type']
-            instance_type_count.setdefault(instance_type, 0)
-            instance_type_count[instance_type] += 1
-        return instance_type_count
-
-    def _setup_time_args(self, period_start, period_end):
-        period_start = _adapt_format(period_start)
-        period_end = _adapt_format(period_end)
-
-        # we need this logic to consider script execution time to take
-        # exactly 1 hour statistics when period is not specified
-        if period_end:
-            self.period_end = period_end
-            period_end_struct = time.strptime(period_end, TIME_FORMAT)
-        else:
-            current_time = time.time()
-            period_end_struct = time.gmtime(current_time)
-            self.period_end = time.strftime(TIME_FORMAT, period_end_struct)
-
+    if period_end:
+        period_end_struct = time.strptime(period_end, TIME_FORMAT)
+        period_end_sec = calendar.timegm(period_end_struct)
+    else:
         if period_start:
-            self.period_start = period_start
-            period_start_struct = time.strptime(period_start, TIME_FORMAT)
+            period_end_sec = period_start_sec + TIME_MAP[period]
         else:
-            period_start_struct = time.gmtime(
-                calendar.timegm(period_end_struct)-self.TIME_MAP[self.period])
-            self.period_start = time.strftime(TIME_FORMAT, period_start_struct)
+            period_end_sec = time.time()
+        period_end_struct = time.gmtime(period_end_sec)
+        period_end = time.strftime(TIME_FORMAT, period_end_struct)
+
+    if not period_start:
+        period_start_sec = period_end_sec - TIME_MAP[period]
+        period_start_struct = time.gmtime(period_start_sec)
+        period_start = time.strftime(TIME_FORMAT, period_start_struct)
+    return period_start, period_end
 
 
 class CurrentStateComputeReport(BaseComputeReport):
@@ -246,6 +219,40 @@ class CurrentStateComputeReport(BaseComputeReport):
         return instance_type_count
 
 
+# TODO Remove time from output
+# TODO Rename
+class PeriodBasedComputeReport(BaseComputeReport):
+
+    AVAILABLE_REPORTS = ('used_flavors',)
+    REPORT_NAME_TEMPLATE = 'ceilometer__%s_per_period'
+
+    def __init__(self, period_start=None, period_end=None, period='1h',
+                 **kwargs):
+        super(PeriodBasedComputeReport, self).__init__(**kwargs)
+        self.period_start, self.period_end = _calculate_time_borders(
+            period_start, period_end, period)
+        self.query = self._get_query()
+
+    def _get_query(self):
+        query = [dict(field="metadata.state", op="eq", value="active")]
+        query.append(dict(field="timestamp", op="gt", value=self.period_start))
+        query.append(dict(field="timestamp", op="lt", value=self.period_end))
+        return query
+
+    def used_flavors(self):
+        statistics = self.cclient.statistics.list(
+            'instance',
+            q=self.query,
+            groupby=('resource_id', 'resource_metadata.instance_type')
+        )
+        instance_type_count = {}
+        for s in statistics:
+            instance_type = s.groupby['resource_metadata.instance_type']
+            instance_type_count.setdefault(instance_type, 0)
+            instance_type_count[instance_type] += 1
+        return instance_type_count
+
+
 # TODO Rename
 class InfrastructureReport(BaseReport):
 
@@ -255,9 +262,6 @@ class InfrastructureReport(BaseReport):
         'storage_io',
     )
     REPORT_NAME_TEMPLATE = 'influxdb__%s_per_period'
-    TIME_MAP = {'1m': 60,
-                '1h': 3600,
-                '1d': 86400,}
 
     @cut_var_name('influxdb_')
     def __init__(self, host, port, user, password, dbname,
@@ -267,14 +271,16 @@ class InfrastructureReport(BaseReport):
         self.period = period
         self.gb_period = '1000y'
         self.status_codes = status_codes
-        self._setup_time_args(period_start, period_end)#, period)
+        self.period_start, self.period_end = _calculate_time_borders(
+            period_start, period_end, period)
         self.client = InfluxDBClient(host, port, user, password, dbname)
 
     def _query(self, query):
         return self.client.query(query=query).raw.get('series', [])
 
     def storage_io(self):
-        result = self._pool_rates()
+        result = []
+        result.append({'pools': self._pool_rates()})
 #        osd_perf_report = self._osd_perf()
 #        for k, v in result.items():
 #            v.update(osd_perf_report.get(k, {}))
@@ -296,7 +302,7 @@ class InfrastructureReport(BaseReport):
                        metric=None):
         result = {}
         if metric:
-            keys = ['_'.join([metric, key]) for key in keys]
+            keys = [':'.join([metric, key]) for key in keys]
         for q in query:
             values = q.get('values', [])
             for i, value in enumerate(values):
@@ -324,11 +330,11 @@ class InfrastructureReport(BaseReport):
                 gb_tag=tag_key)
             query = self._query(query_string)
             res = self._process_query(
-                query, aggregates.keys(), tag_key=tag_key, metric=metric)
+                query, ('avg', 'max'), tag_key=tag_key, metric=metric)
             for k, v in res.items():
                 result.setdefault(k, {})
                 result[k].update(v)
-        return {'pools': result}
+        return result
 
     def host_instances_count(self):
         aggregates = {'mean': 'value', 'max': 'value'}
@@ -338,7 +344,8 @@ class InfrastructureReport(BaseReport):
             select=aggregates,
             gb_tag=tag_key)
         query = self._query(query_string)
-        result = self._process_query(query, aggregates.keys(), tag_key=tag_key)
+        result = self._process_query(query, ('avg', 'max'), tag_key=tag_key,
+                                     metric='instance_number')
         return result
 
     def api_services_request_count(self):
@@ -367,61 +374,31 @@ class InfrastructureReport(BaseReport):
                 where=("value > 0", "backend = '%s'" % service))
             query = self._query(query_string)
             res = self._process_query(
-                query, aggregates.keys(), metric=response_code)
+                query, ('number', ), metric=response_code)
             result.update(res)
 
         if self.status_codes:
             return result
 
         # sum different status codes responses
-        result = sum(result.values())
+        result = {'number': sum(result.values())}
         return result
-
-    # TODO Make flexible periods
-    # TODO Reuse method with compute class
-    def _setup_time_args(self, period_start, period_end):#, period):
-        period_start = _adapt_format(period_start)
-        period_end = _adapt_format(period_end)
-
-        # we need this logic to consider script execution time to take
-        # exactly 1 hour statistics when period is not specified
-        if period_start:
-            self.period_start = period_start
-            period_start_struct = time.strptime(period_start, TIME_FORMAT)
-            period_start_sec = calendar.timegm(period_start_struct)
-
-        if period_end:
-            self.period_end = period_end
-            period_end_struct = time.strptime(period_end, TIME_FORMAT)
-            period_end_sec = calendar.timegm(period_end_struct)
-        else:
-            if period_start:
-                period_end_sec = period_start_sec + self.TIME_MAP[self.period]
-            else:
-                period_end_sec = time.time()
-            period_end_struct = time.gmtime(period_end_sec)
-            self.period_end = time.strftime(TIME_FORMAT, period_end_struct)
-
-        if not period_start:
-            period_start_sec = period_end_sec-self.TIME_MAP[self.period]
-            period_start_struct = time.gmtime(period_start_sec)
-            self.period_start = time.strftime(TIME_FORMAT, period_start_struct)
 
     def _compile_query(self, measurement, select, where=None, gb_tag=None):
         if isinstance(select, dict):
-            select = ', '.join(['%s(%s)' % (a, v) for a, v in select.items()])
-        query = 'SELECT %s FROM %s WHERE ' % (select, measurement)
+            select = ", ".join(["%s(%s)" % (a, v) for a, v in select.items()])
+        query = "SELECT %s FROM %s WHERE " % (select, measurement)
         if where:
             for w in where:
                 query += w + " AND "
         query += (
-            'time >= \'%(period_start)s\''
-            ' AND time < \'%(period_end)s\''
-            ' GROUP BY time(%(gb_period)s)'
+            "time >= '%(period_start)s'"
+            " AND time < '%(period_end)s'"
+            " GROUP BY time(%(gb_period)s)"
         ) % self.__dict__
         if gb_tag:
-            query += ',%s' % gb_tag
-        query += ' fill(0)'
+            query += ",%s" % gb_tag
+        query += " fill(0)"
         return query
 
 
