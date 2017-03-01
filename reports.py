@@ -328,7 +328,7 @@ class InfrastructureReport(BaseReport):
             for k, v in res.items():
                 result.setdefault(k, {})
                 result[k].update(v)
-        return result
+        return {'pools': result}
 
     def host_instances_count(self):
         aggregates = {'mean': 'value', 'max': 'value'}
