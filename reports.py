@@ -101,9 +101,9 @@ class BaseReport(object):
 
     def get_reports(self):
         result = {}
-        for method in self.AVAILABLE_REPORTS:
+        for method, descr in self.AVAILABLE_REPORTS:
             report = self.REPORT_NAME_TEMPLATE % method
-            result[report] = getattr(self, method)()
+            result[(report, descr)] = getattr(self, method)()
         return result
 
 
@@ -187,7 +187,12 @@ def _calculate_time_borders(period_start, period_end, period):
 
 class CurrentStateComputeReport(BaseComputeReport):
 
-    AVAILABLE_REPORTS = ('host_instances_count', 'used_flavors')
+    AVAILABLE_REPORTS = (
+        ('host_instances_count',
+         'Current instance number on each host'),
+        ('used_flavors',
+         'Current report for used instance types'),
+    )
     REPORT_NAME_TEMPLATE = 'nova__%s'
 
     def __init__(self, **kwargs):
@@ -203,10 +208,10 @@ class CurrentStateComputeReport(BaseComputeReport):
 
     def host_instances_count(self):
         hypervisors = self.nova.hypervisors.list()
-        host_instances_count = {h.service['host']: 0 for h in hypervisors}
+        host_instances_count = {h.service['host']: {'Instance number': 0} for h in hypervisors}
         for instance in self.instance_list:
             host = instance.to_dict()['OS-EXT-SRV-ATTR:host']
-            host_instances_count[host] += 1
+            host_instances_count[host]['Instance number'] += 1
         return host_instances_count
 
     def used_flavors(self):
@@ -214,8 +219,8 @@ class CurrentStateComputeReport(BaseComputeReport):
         instance_type_count = {}
         for instance in self.instance_list:
             flavor_name = flavors[instance.flavor['id']]
-            instance_type_count.setdefault(flavor_name, 0)
-            instance_type_count[flavor_name] += 1
+            instance_type_count.setdefault(flavor_name, {'Instance number': 0})
+            instance_type_count[flavor_name]['Instance number'] += 1
         return instance_type_count
 
 
@@ -223,14 +228,15 @@ class CurrentStateComputeReport(BaseComputeReport):
 # TODO Rename
 class PeriodBasedComputeReport(BaseComputeReport):
 
-    AVAILABLE_REPORTS = ('used_flavors',)
+    AVAILABLE_REPORTS = (
+        ('used_flavors',
+         'Statistics for instance types for period '),
+    )
     REPORT_NAME_TEMPLATE = 'ceilometer__%s_per_period'
 
-    def __init__(self, period_start=None, period_end=None, period='1h',
-                 **kwargs):
+    def __init__(self, start_time=None, end_time=None, **kwargs):
         super(PeriodBasedComputeReport, self).__init__(**kwargs)
-        self.period_start, self.period_end = _calculate_time_borders(
-            period_start, period_end, period)
+        self.period_start, self.period_end = start_time, end_time
         self.query = self._get_query()
 
     def _get_query(self):
@@ -248,8 +254,8 @@ class PeriodBasedComputeReport(BaseComputeReport):
         instance_type_count = {}
         for s in statistics:
             instance_type = s.groupby['resource_metadata.instance_type']
-            instance_type_count.setdefault(instance_type, {'instance_number': 0})
-            instance_type_count[instance_type]['instance_number'] += 1
+            instance_type_count.setdefault(instance_type, {'Instance number': 0})
+            instance_type_count[instance_type]['Instance number'] += 1
         return instance_type_count
 
 
@@ -257,22 +263,23 @@ class PeriodBasedComputeReport(BaseComputeReport):
 class InfrastructureReport(BaseReport):
 
     AVAILABLE_REPORTS = (
-        'host_instances_count',
-        'api_services_request_count',
-        'storage_io',
+        ('host_instances_count',
+         'Avarage and maximum instance number on each host for period'),
+        ('api_services_request_count',
+         'API services number of requests for each hour for period'),
+        ('storage_io',
+         'Ceph pools bytes and operations rate for period'),
     )
     REPORT_NAME_TEMPLATE = 'influxdb__%s_per_period'
 
     @cut_var_name('influxdb_')
     def __init__(self, host, port, user, password, dbname,
-                 period_start=None, period_end=None,
-                 period='1h', status_codes=False, **kwargs):
+                 start_time=None, end_time=None,
+                 status_codes=False, **kwargs):
         super(InfrastructureReport, self).__init__()
-        self.period = period
         self.gb_period = '1000y'
         self.status_codes = status_codes
-        self.period_start, self.period_end = _calculate_time_borders(
-            period_start, period_end, period)
+        self.period_start, self.period_end = start_time, end_time
         self.client = InfluxDBClient(host, port, user, password, dbname)
 
     def _query(self, query):
@@ -302,7 +309,7 @@ class InfrastructureReport(BaseReport):
                        metric=None, gb_time=False):
         result = {}
         if metric:
-            keys = [':'.join([metric, key]) for key in keys]
+            keys = [' '.join([metric, key]) for key in keys]
         for q in query:
             values = q.get('values', [])
             for i, value in enumerate(values):
@@ -325,7 +332,7 @@ class InfrastructureReport(BaseReport):
         )
         result = {}
         tag_key = 'pool'
-        aggregates = {'mean': 'value', 'max': 'value'}
+        aggregates = (('mean', 'value'), ('max', 'value'))
         for metric in metrics:
             query_string = self._compile_query(
                 measurement=metric,
@@ -340,7 +347,7 @@ class InfrastructureReport(BaseReport):
         return result
 
     def host_instances_count(self):
-        aggregates = {'mean': 'value', 'max': 'value'}
+        aggregates = (('mean', 'value'), ('max', 'value'))
         tag_key = 'hostname'
         query_string = self._compile_query(
             measurement='openstack_nova_running_instances',
@@ -348,7 +355,7 @@ class InfrastructureReport(BaseReport):
             gb_tag=tag_key)
         query = self._query(query_string)
         result = self._process_query(query, ('avg', 'max'), tag_key=tag_key,
-                                     metric='instance_number')
+                                     metric='Instance number')
         return result
 
     def api_services_request_count(self):
@@ -367,7 +374,7 @@ class InfrastructureReport(BaseReport):
     # TODO Workaround issue with resetted counter
     def _request_count(self, service):
         result = {}
-        aggregates = {'spread': 'value'}
+        aggregates = (('spread', 'value'),)
         for i in range(1, 6):
             response_code = '%sxx' % i
             measurement = 'haproxy_backend_response_' + response_code
@@ -378,8 +385,8 @@ class InfrastructureReport(BaseReport):
                 gb_period='1h')
             query = self._query(query_string)
             res = self._process_query(
-                query, ('request_number',),
-                metric=':'.join([service, response_code]),
+                query, ('request number',),
+                metric=' '.join([service, response_code]),
                 gb_time=True)
             for t, d in res.items():
                 result.setdefault(t, {})
@@ -401,13 +408,12 @@ class InfrastructureReport(BaseReport):
         res = {}
         for t, d in result.items():
             res.setdefault(t, {})
-            res[t].update({service+':request_number': sum(d.values())})
+            res[t].update({service+' request number': sum(d.values())})
         return _swap_keys(res)
 
     def _compile_query(self, measurement, select, where=None, gb_tag=None,
                        gb_period=None):
-        if isinstance(select, dict):
-            select = ", ".join(["%s(%s)" % (a, v) for a, v in select.items()])
+        select = ", ".join(["%s(%s)" % (a, v) for a, v in select])
         query = "SELECT %s FROM %s WHERE " % (select, measurement)
         if where:
             for w in where:
@@ -475,12 +481,12 @@ REPORT_TYPES_MAP = {
 #               writer.writerow(row)
 
 
-def write_cvs_report(report):
-
+def write_cvs_report(report, start_time, end_time):
+    interval = '%s - %s' % (start_time, end_time)
     reports_dir = os.path.join(os.getcwd(), 'reports')
     if not os.path.isdir(reports_dir):
         os.mkdir(reports_dir)
-    report_files_list = [f for f in os.listdir(reports_dir)
+    report_files_list = [os.path.splitext(f)[0] for f in os.listdir(reports_dir)
                          if f.startswith('report-')]
     if report_files_list:
         file_idx = max([
@@ -492,7 +498,13 @@ def write_cvs_report(report):
     with open(report_file_path, 'wb') as f:
         writer = csv.writer(f)
         for report_name, report_data in report.items():
-           writer.writerow([report_name])
+           descr = report_name[1]
+
+           time = end_time
+           if 'period' in descr:
+               time = interval
+           f.write("%s %s\n" % (descr, time))
+
            sorted_columns = sorted(report_data.values()[0].keys())
            writer.writerow([''] + sorted_columns)
            for key in sorted(report_data.keys()):
@@ -500,11 +512,15 @@ def write_cvs_report(report):
                row = [key]
                if sorted_columns:
                    for column in sorted_columns:
-                       row.append(value[column])
+                       v = value[column]
+                       if isinstance(v, float):
+                           v = round(v, 2)
+                       row.append(v)
                else:
                    row.append(value)
                writer.writerow(row)
-           writer.writerow([''])
+           f.write('\n')
+
 
 def main():
     args = parser.parse_args()
@@ -518,14 +534,18 @@ def main():
     else:
         report_types = (args.report_type,)
 
+    start_time, end_time = _calculate_time_borders(
+        args.period_start, args.period_end, args.period)
     reports = {}
     for report_type in report_types:
-        r = report_types_map[report_type](**args.__dict__)
+        r = report_types_map[report_type](
+            start_time=start_time,
+            end_time=end_time,
+            **args.__dict__)
         reports.update(r.get_reports())
 
-
     pprint.pprint(reports)
-    write_cvs_report(reports)
+    write_cvs_report(reports, start_time, end_time)
 
 
 if __name__ == "__main__":
