@@ -224,7 +224,6 @@ class CurrentStateComputeReport(BaseComputeReport):
         return instance_type_count
 
 
-# TODO Remove time from output
 # TODO Rename
 class PeriodBasedComputeReport(BaseComputeReport):
 
@@ -371,23 +370,34 @@ class InfrastructureReport(BaseReport):
             result.update(self._request_count(service))
         return result
 
-    # TODO Workaround issue with resetted counter
     def _request_count(self, service):
         result = {}
-        aggregates = (('spread', 'value'),)
+        aggregates = ('last(value) - min(value) + max(value) - first(value)',
+                      'spread(value)',)
+        key_desc = 'request number'
         for i in range(1, 6):
             response_code = '%sxx' % i
-            measurement = 'haproxy_backend_response_' + response_code
-            query_string = self._compile_query(
-                measurement=measurement,
-                select=aggregates,
-                where=("value > 0", "backend = '%s'" % service),
-                gb_period='1h')
-            query = self._query(query_string)
-            res = self._process_query(
-                query, ('request number',),
-                metric=' '.join([service, response_code]),
-                gb_time=True)
+            metric = 'haproxy_backend_response_' + response_code
+            temp_res = []
+            metric_desc = ' '.join([service, response_code])
+            for aggr in aggregates:
+                query_string = self._compile_query(
+                    measurement=metric,
+                    select=aggr,
+                    where=("value > 0", "backend = '%s'" % service),
+                    gb_period='1h')
+                query = self._query(query_string)
+                res = self._process_query(
+                    query, (key_desc,),
+                    metric=metric_desc,
+                    gb_time=True)
+                temp_res.append(res)
+            # workaround for reseted counter
+            metric_desc = ' '.join([metric_desc, key_desc])
+            for t in res.keys():
+                res[t][metric_desc] = min((temp_res[0][t][metric_desc],
+                    temp_res[1][t][metric_desc]))
+
             for t, d in res.items():
                 result.setdefault(t, {})
                 result[t].update(d)
@@ -413,7 +423,8 @@ class InfrastructureReport(BaseReport):
 
     def _compile_query(self, measurement, select, where=None, gb_tag=None,
                        gb_period=None):
-        select = ", ".join(["%s(%s)" % (a, v) for a, v in select])
+        if isinstance(select, tuple):
+            select = ", ".join(["%s(%s)" % (a, v) for a, v in select])
         query = "SELECT %s FROM %s WHERE " % (select, measurement)
         if where:
             for w in where:
@@ -520,7 +531,7 @@ def write_cvs_report(report, start_time, end_time):
                    row.append(value)
                writer.writerow(row)
            f.write('\n')
-    return report_file_path      
+    return report_file_path
 
 
 def main():
@@ -544,7 +555,7 @@ def main():
             end_time=end_time,
             **args.__dict__)
         reports.update(r.get_reports())
-
+    #pprint.pprint(reports)
     print write_cvs_report(reports, start_time, end_time)
 
 
