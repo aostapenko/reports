@@ -520,6 +520,7 @@ def write_cvs_report(report, start_time, end_time):
                    row.append(value)
                writer.writerow(row)
            f.write('\n')
+    return report_file_path      
 
 
 def main():
@@ -544,8 +545,7 @@ def main():
             **args.__dict__)
         reports.update(r.get_reports())
 
-    pprint.pprint(reports)
-    write_cvs_report(reports, start_time, end_time)
+    print write_cvs_report(reports, start_time, end_time)
 
 
 if __name__ == "__main__":
