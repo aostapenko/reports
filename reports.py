@@ -1,3 +1,4 @@
+#!/usr/bin/python2.7
 import argparse
 import calendar
 import csv
@@ -372,31 +373,43 @@ class InfrastructureReport(BaseReport):
 
     def _request_count(self, service):
         result = {}
-        aggregates = ('last(value) - min(value) + max(value) - first(value)',
-                      'spread(value)',)
+        aggregates = ('last(value) - min(value) + max(value) - first(value), spread(value)')
         key_desc = 'request number'
+        # This metrics are counters by each haproxy node that reset unpredictably
         for i in range(1, 6):
             response_code = '%sxx' % i
             metric = 'haproxy_backend_response_' + response_code
-            temp_res = []
             metric_desc = ' '.join([service, response_code])
-            for aggr in aggregates:
-                query_string = self._compile_query(
-                    measurement=metric,
-                    select=aggr,
-                    where=("value > 0", "backend = '%s'" % service),
-                    gb_period='1h')
-                query = self._query(query_string)
-                res = self._process_query(
-                    query, (key_desc,),
-                    metric=metric_desc,
-                    gb_time=True)
-                temp_res.append(res)
+            query_string = self._compile_query(
+                measurement=metric,
+                select=aggregates,
+                where=("backend = '%s'" % service,),
+                gb_period='1h', gb_tag='hostname')
+            query = self._query(query_string)
+
+            # Taking min from two
+            for q in query:
+                values = q['values']
+                for value in values:
+                    value[1] = min(value[1], value[2])
+                    value.pop(-1)
+
+            # Summing hosts
+            temp_values = []
+            for q in query:
+                values = q['values']
+                for i, v in enumerate(values):
+                    if len(temp_values) < i + 1:
+                        temp_values.append(v)
+                    else:
+                        temp_values[i][1] += v[1]
+
+            temp_res = [{'values': temp_values}]
+            res = self._process_query(
+                temp_res, (key_desc,),
+                metric=metric_desc,
+                gb_time=True)
             # workaround for reseted counter
-            metric_desc = ' '.join([metric_desc, key_desc])
-            for t in res.keys():
-                res[t][metric_desc] = min((temp_res[0][t][metric_desc],
-                    temp_res[1][t][metric_desc]))
 
             for t, d in res.items():
                 result.setdefault(t, {})
@@ -555,7 +568,7 @@ def main():
             end_time=end_time,
             **args.__dict__)
         reports.update(r.get_reports())
-    #pprint.pprint(reports)
+    pprint.pprint(reports)
     print write_cvs_report(reports, start_time, end_time)
 
 
