@@ -568,7 +568,7 @@ def main():
             end_time=end_time,
             **args.__dict__)
         reports.update(r.get_reports())
-    pprint.pprint(reports)
+    #pprint.pprint(reports)
     print write_cvs_report(reports, start_time, end_time)
 
 
