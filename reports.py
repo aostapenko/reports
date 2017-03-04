@@ -75,9 +75,6 @@ parser.add_argument("--influxdb_dest_dbname",
                     help="InfluxDB destination database name")
 
 
-RESPONSES_MEASUREMENT = 'haproxy_backend_responses'
-
-
 def _discover_auth_versions(session, auth_url):
     ks_discover = discover.Discover(session=session, url=auth_url)
     v2_auth_url = ks_discover.url_for('2.0')
@@ -171,12 +168,6 @@ class DataProcessorBase(object):
             query += " fill(0)"
         return query
 
-
-class DataProcessor(DataProcessorBase):
-
-    def __init__(self, **kwargs):
-        super(DataProcessor, self).__init__(**kwargs)
-
     def _dest_measurement_last_date(self, measurement):
         query_string = self._compile_query(measurement, select='last(value)',
                                            gb_period=None)
@@ -185,17 +176,34 @@ class DataProcessor(DataProcessorBase):
             return None
         return query[0]['values'][0][0]
 
-    def api_services_requests(self):
-        start_time = self._dest_measurement_last_date(RESPONSES_MEASUREMENT)
-        result = self._request_count(start_time)
-        return result
+    def store_data(self, data):
+        def _sort_key(p):
+            t = p['time']
+            try:
+                return datetime.strptime(t, TIME_FORMAT_MILLISEC)
+            except ValueError:
+                return datetime.strptime(t, TIME_FORMAT)
 
-    def _request_count(self, start_time):
+        data.sort(key=_sort_key)
+
+        for i in xrange(0, len(data), CHUNK_SIZE):
+            self._write_points(data[i:i + CHUNK_SIZE])
+            time.sleep(0.2)
+
+    def process(self):
+        start_time = self._dest_measurement_last_date(self.DEST_MEASUREMENT)
+        data = self.prepare_data(start_time)
+        self.store_data(data)
+
+
+class RequestsDataProcessor(DataProcessorBase):
+    DEST_MEASUREMENT = 'haproxy_backend_responses'
+
+    def prepare_data(self, start_time):
         result = {}
         aggregates = ('difference(value)')
-        # This metrics are counters by each haproxy node that reset unpredictably
+        # These metrics are counters by each haproxy node that reset unpredictably
         data = []
-        #start_time = '2017-03-04T00:30:00Z'
         for i in range(1, 6):
             response_code = '%sxx' % i
             measurement = 'haproxy_backend_response_' + response_code
@@ -209,7 +217,7 @@ class DataProcessor(DataProcessorBase):
 
             for element in query:
                 common_point_data = {
-                    "measurement": RESPONSES_MEASUREMENT,
+                    "measurement": self.DEST_MEASUREMENT,
                     "tags": {
                         "hostname": element['tags']['hostname'],
                         "backend": element['tags']['backend'],
@@ -224,26 +232,14 @@ class DataProcessor(DataProcessorBase):
                     point.update(common_point_data)
                     data.append(point)
 
-        def _sort_key(p):
-            t = p['time']
-            try:
-                return datetime.strptime(t, TIME_FORMAT_MILLISEC)
-            except ValueError:
-                return datetime.strptime(t, TIME_FORMAT)
-
-        data.sort(key=_sort_key)
-
-        for i in xrange(0, len(data), CHUNK_SIZE):
-            self._write_points(data[i:i + CHUNK_SIZE])
-            time.sleep(0.2)
+        return data
 
 
 def main():
     args = parser.parse_args()
-    data_processor = DataProcessor(**args.__dict__)
-    data_processor.api_services_requests()
+    data_processor = RequestsDataProcessor(**args.__dict__)
+    data_processor.process()
 
 
 if __name__ == "__main__":
     main()
-
