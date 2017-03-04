@@ -1,6 +1,7 @@
 #!/usr/bin/python2.7
 import argparse
 import calendar
+from datetime import datetime
 import logging
 import os
 import pprint
@@ -18,6 +19,10 @@ from keystoneauth1 import session
 logger = logging.getLogger(__file__)
 logging.basicConfig()
 logger.setLevel(logging.INFO)
+
+TIME_FORMAT_MILLISEC = "%Y-%m-%dT%H:%M:%S.%fZ"
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+CHUNK_SIZE = 1000
 
 
 parser = argparse.ArgumentParser()
@@ -54,20 +59,23 @@ parser.add_argument("--influxdb_port",
                     help="InfluxDB port")
 parser.add_argument("--influxdb_username",
                     default=os.environ.get("INFLUXDB_USER",
-                                           "lma"),
+                                           "atp"),
                     help="InfluxDB username")
 parser.add_argument("--influxdb_password",
                     default=os.environ.get("INFLUXDB_PASSWORD",
-                                           "ieFrFc7An2ooWGBE8FTGGn7y"),
+                                           "uHWYXdyiGgFEFS6pg8mzB1gv"),
                     help="InfluxDB password")
 parser.add_argument("--influxdb_source_dbname",
-                    default=os.environ.get("INFLUXDB_INPUT_DB_NAME",
+                    default=os.environ.get("INFLUXDB_SOURCE_DB_NAME",
                                            "lma"),
                     help="InfluxDB source database name")
 parser.add_argument("--influxdb_dest_dbname",
-                    default=os.environ.get("INFLUXDB_OUTPUT_DB_NAME",
-                                           "lma"),
+                    default=os.environ.get("INFLUXDB_DEST_DB_NAME",
+                                           "atp"),
                     help="InfluxDB destination database name")
+
+
+RESPONSES_MEASUREMENT = 'haproxy_backend_responses'
 
 
 def _discover_auth_versions(session, auth_url):
@@ -90,10 +98,10 @@ def cut_arg_names(prefix):
     return decorator
 
 
-class DataProcessor(object):
+class DataProcessorBase(object):
 
     def __init__(self, **kwargs):
-        super(DataProcessor, self).__init__()
+        super(DataProcessorBase, self).__init__()
         self._init_os_clients(**kwargs)
         self._init_influx_clients(**kwargs)
         self.gb_period = '1000y'
@@ -132,11 +140,110 @@ class DataProcessor(object):
         self.ceilometer = ceilometer_client.get_client(2, session=sess,
                                                        endpoint_type=endpoint_type)
 
+    def _query_source(self, query):
+        return self.source_db_client.query(query=query).raw.get('series', [])
+
+    def _query_dest(self, query):
+        return self.dest_db_client.query(query=query).raw.get('series', [])
+
+    def _write_points(self, data):
+        return self.dest_db_client.write_points(data, time_precision='ms')
+
+    def _compile_query(self, measurement, select, where=(), gb_tags=(),
+                       gb_period='1000y', start_time=None):
+        if isinstance(select, tuple):
+            select = ", ".join(["%s(%s)" % (a, v) for a, v in select])
+        query = "SELECT %s FROM %s " % (select, measurement)
+
+        if start_time:
+            where = list(where)
+            where.append("time >= '%s' - 2m" % start_time)
+        if where:
+            query += "WHERE "
+            query += " AND ".join(where)
+
+        if gb_period:
+           gb_tags = list(gb_tags)
+           gb_tags.append("time(%s)" % gb_period)
+        if gb_tags:
+            query += " GROUP BY "
+            query += ",".join(gb_tags)
+            query += " fill(0)"
+        return query
+
+
+class DataProcessor(DataProcessorBase):
+
+    def __init__(self, **kwargs):
+        super(DataProcessor, self).__init__(**kwargs)
+
+    def _dest_measurement_last_date(self, measurement):
+        query_string = self._compile_query(measurement, select='last(value)',
+                                           gb_period=None)
+        query = self._query_dest(query_string)
+        if not query:
+            return None
+        return query[0]['values'][0][0]
+
+    def api_services_requests(self):
+        start_time = self._dest_measurement_last_date(RESPONSES_MEASUREMENT)
+        result = self._request_count(start_time)
+        return result
+
+    def _request_count(self, start_time):
+        result = {}
+        aggregates = ('difference(value)')
+        # This metrics are counters by each haproxy node that reset unpredictably
+        data = []
+        #start_time = '2017-03-04T00:30:00Z'
+        for i in range(1, 6):
+            response_code = '%sxx' % i
+            measurement = 'haproxy_backend_response_' + response_code
+            query_string = self._compile_query(
+                measurement=measurement,
+                select=aggregates,
+                start_time=start_time,
+                gb_tags=('hostname', 'backend'),
+                gb_period=None)
+            query = self._query_source(query_string)
+
+            for element in query:
+                common_point_data = {
+                    "measurement": RESPONSES_MEASUREMENT,
+                    "tags": {
+                        "hostname": element['tags']['hostname'],
+                        "backend": element['tags']['backend'],
+                        "response_code": response_code,
+                    }
+                }
+                for value in element['values']:
+                    if value[1] <= 0:
+                        continue
+                    point = {"time": value[0],
+                             "fields": {'value': value[1]}}
+                    point.update(common_point_data)
+                    data.append(point)
+
+        def _sort_key(p):
+            t = p['time']
+            try:
+                return datetime.strptime(t, TIME_FORMAT_MILLISEC)
+            except ValueError:
+                return datetime.strptime(t, TIME_FORMAT)
+
+        data.sort(key=_sort_key)
+
+        for i in xrange(0, len(data), CHUNK_SIZE):
+            self._write_points(data[i:i + CHUNK_SIZE])
+            time.sleep(0.2)
+
 
 def main():
     args = parser.parse_args()
     data_processor = DataProcessor(**args.__dict__)
+    data_processor.api_services_requests()
 
 
 if __name__ == "__main__":
     main()
+
