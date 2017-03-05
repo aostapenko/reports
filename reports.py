@@ -1,6 +1,5 @@
 #!/usr/bin/python2.7
 import argparse
-import calendar
 from datetime import datetime
 import logging
 import os
@@ -8,12 +7,12 @@ import pprint
 import sys
 import time
 
-from ceilometerclient import client as ceilometer_client
 from influxdb import InfluxDBClient
 from keystoneauth1 import discover
 from keystoneauth1.identity import v2
 from keystoneauth1.identity import v3
 from keystoneauth1 import session
+from novaclient import client as nova_client
 
 
 logger = logging.getLogger(__file__)
@@ -131,8 +130,8 @@ class DataProcessorBase(object):
                             'to authenticate with using the given auth_url.')
 
         sess.auth = auth
-        self.ceilometer = ceilometer_client.get_client(2, session=sess,
-                                                       endpoint_type=endpoint_type)
+        self.nova = nova_client.Client(
+            2, session=sess, endpoint_type=endpoint_type)
 
     def _query_source(self, query):
         return self.source_db_client.query(query=query).raw.get('series', [])
@@ -248,6 +247,33 @@ class InstanceDataProcessor(DataProcessorBase):
             dbname=kwargs['influxdb_ceilometer_dbname'], **kwargs)
         self.dest_db_client = self._get_influx_client(
             dbname=kwargs['influxdb_dest_dbname'], **kwargs)
+        self._init_os_clients(**kwargs)
+        self._image_names = {}
+
+    def _get_image_name(self, uuid):
+        if uuid not in self._image_names:
+            try:
+                image_name = self.nova.images.get(uuid).name
+            except Exception:
+                image_name = None
+            self._image_names[uuid] = image_name
+        return self._image_names[uuid]
+
+    def _get_instance_image(self, uuid):
+        search_opts = {
+            'all_tenants': True,
+            'uuid': uuid,
+        }
+        instance_list = self.nova.servers.list(search_opts=search_opts)
+        if not instance_list:
+            search_opts['deleted'] = True
+            instance_list = self.nova.servers.list(search_opts=search_opts)
+        image = instance_list[0].image
+        if isinstance(image, dict):
+            image_id = image['id']
+            return self._get_image_name(image_id) or image_id
+        else:
+            return 'Not from image'
 
     def prepare_data(self, start_time):
         measurement = 'sample'
@@ -280,21 +306,23 @@ class InstanceDataProcessor(DataProcessorBase):
             return '.'.join([m, f[0:6]]) + 'Z'
 
         data = []
-        t1 = time.time()
         for element in query:
+            tags = element['tags']
+            uuid = tags['resource_id']
+            image = self._get_instance_image(uuid)
             common_point_data = {
                 "measurement": self.DEST_MEASUREMENT,
                 "tags": {
-                    "hostname": element['tags']['metadata.instance_host'],
-                    "status": element['tags']['metadata.status'],
-                    "instance_type": element['tags']['metadata.instance_type'],
-                    "resource_id": element['tags']['resource_id'],
+                    "hostname": tags['metadata.instance_host'],
+                    "status": tags['metadata.status'],
+                    "instance_type": tags['metadata.instance_type'],
+                    "image": image,
+                    "resource_id": uuid,
                 }
             }
             for value in element['values']:
-                value_dict = dict(zip(element['columns'], value))
-                point = {"time": _round(value_dict['time']),
-                         "fields": {'value': element['tags']['resource_id']}}
+                point = {"time": _round(value[0]),
+                         "fields": {'value': uuid}}
                 point.update(common_point_data)
                 data.append(point)
         return data
