@@ -60,15 +60,21 @@ parser.add_argument("--influxdb_port",
 parser.add_argument("--influxdb_username",
                     default=os.environ.get("INFLUXDB_USER",
                                            "atp"),
-                    help="InfluxDB username")
+                    help="InfluxDB username. Must have have READ rights for "
+                         "lma and ceilometer dbs and ALL rights for "
+                         "destination db.")
 parser.add_argument("--influxdb_password",
                     default=os.environ.get("INFLUXDB_PASSWORD",
                                            "uHWYXdyiGgFEFS6pg8mzB1gv"),
                     help="InfluxDB password")
-parser.add_argument("--influxdb_source_dbname",
-                    default=os.environ.get("INFLUXDB_SOURCE_DB_NAME",
+parser.add_argument("--influxdb_lma_dbname",
+                    default=os.environ.get("INFLUXDB_LMA_DB_NAME",
                                            "lma"),
-                    help="InfluxDB source database name")
+                    help="InfluxDB lma database name")
+parser.add_argument("--influxdb_ceilometer_dbname",
+                    default=os.environ.get("INFLUXDB_CEILOMETER_DB_NAME",
+                                           "ceilometer"),
+                    help="InfluxDB ceilometer database name")
 parser.add_argument("--influxdb_dest_dbname",
                     default=os.environ.get("INFLUXDB_DEST_DB_NAME",
                                            "atp"),
@@ -97,19 +103,10 @@ def cut_arg_names(prefix):
 
 class DataProcessorBase(object):
 
-    def __init__(self, **kwargs):
-        super(DataProcessorBase, self).__init__()
-        self._init_os_clients(**kwargs)
-        self._init_influx_clients(**kwargs)
-        self.gb_period = '1000y'
-
     @cut_arg_names('influxdb_')
-    def _init_influx_clients(self, host, port, username, password,
-                             source_dbname, dest_dbname, **kwargs):
-        self.source_db_client = InfluxDBClient(host, port, username,
-                                               password, source_dbname)
-        self.dest_db_client = InfluxDBClient(host, port, username,
-                                             password, dest_dbname)
+    def _get_influx_client(self, host, port, username, password,
+                           dbname, **kwargs):
+        return InfluxDBClient(host, port, username, password, dbname)
 
     @cut_arg_names('os_')
     def _init_os_clients(self, username, password, auth_url, project_name,
@@ -197,19 +194,26 @@ class DataProcessorBase(object):
 
 
 class RequestsDataProcessor(DataProcessorBase):
-    DEST_MEASUREMENT = 'haproxy_backend_responses'
+    DEST_MEASUREMENT = 'atp_haproxy_backend_responses'
+
+    def __init__(self, **kwargs):
+        super(RequestsDataProcessor, self).__init__()
+        self.source_db_client = self._get_influx_client(
+            dbname=kwargs['influxdb_lma_dbname'], **kwargs)
+        self.dest_db_client = self._get_influx_client(
+            dbname=kwargs['influxdb_dest_dbname'], **kwargs)
 
     def prepare_data(self, start_time):
         result = {}
-        aggregates = ('difference(value)')
         # These metrics are counters by each haproxy node that reset unpredictably
         data = []
+        select = 'difference(value)'
         for i in range(1, 6):
             response_code = '%sxx' % i
             measurement = 'haproxy_backend_response_' + response_code
             query_string = self._compile_query(
                 measurement=measurement,
-                select=aggregates,
+                select=select,
                 start_time=start_time,
                 gb_tags=('hostname', 'backend'),
                 gb_period=None)
@@ -235,10 +239,78 @@ class RequestsDataProcessor(DataProcessorBase):
         return data
 
 
+class InstanceDataProcessor(DataProcessorBase):
+    DEST_MEASUREMENT = 'atp_instance'
+
+    def __init__(self, **kwargs):
+        super(InstanceDataProcessor, self).__init__()
+        self.source_db_client = self._get_influx_client(
+            dbname=kwargs['influxdb_ceilometer_dbname'], **kwargs)
+        self.dest_db_client = self._get_influx_client(
+            dbname=kwargs['influxdb_dest_dbname'], **kwargs)
+
+    def prepare_data(self, start_time):
+        measurement = 'sample'
+        select = 'value'
+        where = (
+            "meter = 'instance'",
+            "metadata.instance_host != ''",
+            "metadata.state != 'deleted'",
+        )
+        gb_tags=(
+            "metadata.instance_host",
+            "metadata.status",
+            "metadata.instance_type",
+            "resource_id",
+        )
+        query_string = self._compile_query(
+            measurement=measurement,
+            select=select,
+            where=where,
+            start_time=start_time,
+            gb_tags=gb_tags,
+            gb_period=None)
+        query = self._query_source(query_string)
+
+        def _round(t):
+            temp = t[0:-1].split('.')
+            if len(temp) < 2:
+                return t
+            m, f = temp
+            return '.'.join([m, f[0:6]]) + 'Z'
+
+        data = []
+        t1 = time.time()
+        for element in query:
+            common_point_data = {
+                "measurement": self.DEST_MEASUREMENT,
+                "tags": {
+                    "hostname": element['tags']['metadata.instance_host'],
+                    "status": element['tags']['metadata.status'],
+                    "instance_type": element['tags']['metadata.instance_type'],
+                    "resource_id": element['tags']['resource_id'],
+                }
+            }
+            for value in element['values']:
+                value_dict = dict(zip(element['columns'], value))
+                point = {"time": _round(value_dict['time']),
+                         "fields": {'value': element['tags']['resource_id']}}
+                point.update(common_point_data)
+                data.append(point)
+        return data
+
+
+DATA_PROCESSORS = (
+    InstanceDataProcessor,
+    RequestsDataProcessor,
+)
+
+
 def main():
     args = parser.parse_args()
-    data_processor = RequestsDataProcessor(**args.__dict__)
-    data_processor.process()
+    for cls in DATA_PROCESSORS:
+        data_processor = cls(**args.__dict__)
+        data_processor.process()
 
 
 if __name__ == "__main__":
