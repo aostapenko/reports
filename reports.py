@@ -2,6 +2,7 @@
 import argparse
 import calendar
 import csv
+import json
 import logging
 import os
 import pprint
@@ -37,7 +38,7 @@ parser.add_argument("--os_password",
                     help="Password for the user")
 parser.add_argument("--os_auth_url",
                     default=os.environ.get("OS_AUTH_URL",
-                                           "http://localhost:5000"),
+                                           "http://172.16.107.3:5000/"),
                     help="Openstack authentification url")
 parser.add_argument("--os_endpoint_type",
                     default=os.environ.get("OS_ENDPOINT_TYPE",
@@ -87,6 +88,11 @@ parser.add_argument("--influxdb_password",
                     default=os.environ.get("INFLUXDB_PASSWORD",
                                            "ieFrFc7An2ooWGBE8FTGGn7y"),
                     help="InfluxDB password")
+
+parser.add_argument("--json",
+                    action='store_true',
+                    default=False,
+                    help="Additionally print reports in json format")
 
 
 def _discover_auth_versions(session, auth_url):
@@ -547,6 +553,10 @@ def write_cvs_report(report, start_time, end_time):
     return report_file_path
 
 
+def to_json(reports):
+    return json.dumps({k[1]: v for k, v in reports.items()})
+
+
 def main():
     args = parser.parse_args()
     if args.period_start or args.period_end:
@@ -568,8 +578,12 @@ def main():
             end_time=end_time,
             **args.__dict__)
         reports.update(r.get_reports())
-    #pprint.pprint(reports)
-    print write_cvs_report(reports, start_time, end_time)
+    if args.json:
+        print to_json(reports)
+    else:
+        f = write_cvs_report(reports, start_time, end_time)
+        print f
+        return f
 
 
 if __name__ == "__main__":
